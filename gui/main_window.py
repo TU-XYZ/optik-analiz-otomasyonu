@@ -11,6 +11,7 @@ Parametrelerin hepsi düzenlenebilir; bir değer değişince analiz yeniden
 """
 from __future__ import annotations
 
+import math
 import os
 import sys
 
@@ -33,10 +34,15 @@ import numpy as np
 
 from core.config import SystemConfig, Lens, Detector, OLED, default_config
 from core import config as cfgmod
-from core import pipeline, image_analysis
+from core import projection as projmod
+from core import solver
+from core import pipeline, image_analysis, optics
+from core.pointing import fmt_px, fmt_shape
 from gui.widgets import (
     ImageView, ResultRow, hline, STYLESHEET, ACCENT, MUTED, GOOD, WARN, BAD,
+    BlankableDoubleSpin,
 )
+from gui.solver_tab import SolverTab
 
 PRESET_DIR = os.path.join(_ROOT, "presets")
 
@@ -177,6 +183,18 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self._son_res = None      # en son analiz sonucu (hızlı hesap kullanır)
+        self._son_cfg = None      # o analizin config'i (rozet kaynağı için)
+        # Preset yüklendiğinde zaten boş gelen alanlar — kullanıcının
+        # sildikleriyle karışmasın diye ayrı tutulur.
+        self._bastan_bos: set[str] = set()
+        # Analiz koşulduysa True: ölçüm sonucu nominal hesaptan üstündür,
+        # canlı hesap onun üzerine yazmamalı.
+        self._analiz_sonucu_var = False
+        # Sınıf sözlüğünü örneğe kopyala: `_build_left_panel` buraya
+        # düzenlenebilir olması gerekiyor (ileride alan eklenirse sınıf
+        # düzeyinde kalması pencereler arasında birikmeye yol açardı).
+        self.ALAN_DUGUM = dict(type(self).ALAN_DUGUM)
         self.setWindowTitle("Optik Analiz — FOV / IFOV / Tilt Ölçümü")
         self.resize(1500, 900)
 
@@ -207,7 +225,10 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(0, 0)
         splitter.setStretchFactor(1, 1)
         splitter.setStretchFactor(2, 0)
-        splitter.setSizes([380, 720, 360])
+        # Sağ panel 360 px'ken uzun kapsama değerleri ("546.677 / 652.620
+        # (tüm ekran…)") satır sarmasına giriyor ve kısa değerler bile
+        # ikiye bölünüyordu. 440 px, en uzun satırı tek satırda tutar.
+        splitter.setSizes([380, 660, 440])
         root.addWidget(splitter, 1)
 
         # Alt: ilerleme + durum
@@ -220,6 +241,15 @@ class MainWindow(QMainWindow):
         bottom.addWidget(self.status_label, 1)
         bottom.addWidget(self.progress, 1)
         root.addLayout(bottom)
+
+        # Açılış durumu = analiz sonrası temizlenmiş durum. Tek yerden
+        # kurulur ki ikisi ayrışmasın: eskiden `_clear_results` yalnızca
+        # analiz BAŞLARKEN çağrılıyordu, dolayısıyla programın ilk açılışı
+        # ile "analiz yapıldı sonra temizlendi" hâli farklı görünüyordu.
+        self._clear_results()
+        # Açılışta da hesapla: varsayılan donanım zaten yüklü, sağ barın
+        # boş durmasının bir sebebi yok.
+        self._canli_hesapla()
 
     def _build_header(self) -> QWidget:
         box = QWidget()
@@ -308,6 +338,11 @@ class MainWindow(QMainWindow):
         self.f_fnum = self._dspin(0.5, 100.0, 2, "")
         self.f_pupil = self._dspin(0.0, 10000.0, 2, " mm")
         self.f_ufov = self._dspin(0.0, 360.0, 2, " °")
+        # Görüntü dairesi çapı — üreticinin kullanılabilir FOV'undan
+        # türetilebilir ama datasheet doğrudan da verebilir. Alanı olmadan
+        # çözücü "görüntü dairesi çapını girin" diyordu ve girilecek yer
+        # yoktu.
+        self.f_circle = self._dspin(0.0, 10000.0, 3, " mm")
         self._grid_row(ll, 0, "Hazır lens", self.f_lens_sel)
         self._grid_row(ll, 1, "Model", self.f_lens_name)
         self._grid_row(ll, 2, "Odak uzaklığı f", self.f_focal,
@@ -319,6 +354,36 @@ class MainWindow(QMainWindow):
         self._grid_row(ll, 5, "Üretici FOV", self.f_ufov,
                        "Üreticinin verdiği kullanılabilir FOV; "
                        "hesaplanan FOV ile karşılaştırma için.")
+        self._grid_row(ll, 6, "Görüntü dairesi", self.f_circle,
+                       "Lensin ürettiği dairesel görüntünün ÇAPI. Sensör "
+                       "köşegeninden küçükse köşeler karanlıktır.\n\n"
+                       "Boş bırakılırsa üretici FOV'undan türetilir; "
+                       "ikisi de boşsa daire kısıtı yok sayılır.")
+
+        # Projeksiyon modeli — FOV/IFOV matematiğinin altındaki asıl varsayım.
+        # Görünür bir alan olması önemli: "FOV yanlış çıkıyor" şüphesinde ilk
+        # bakılacak yer burasıdır.
+        self.f_proj = QComboBox()
+        for key in projmod.MODELS:
+            self.f_proj.addItem(projmod.MODEL_LABELS[key], key)
+            # Her kalemin kendi ipucu: ne anlama geldiği ve nerede
+            # kullanıldığı. Model seçimi FOV/IFOV'un tamamını belirlediği
+            # için listede körlemesine seçim yapılmamalı.
+            self.f_proj.setItemData(self.f_proj.count() - 1,
+                                    projmod.MODEL_HELP.get(key, ""),
+                                    Qt.ToolTipRole)
+        self.f_proj.activated.connect(self._update_projection_label)
+        self._grid_row(ll, 7, "Projeksiyon", self.f_proj,
+                       "Lensin açı → görüntü yüksekliği haritası. "
+                       "Rektilineer (r = f·tan θ) 40-60° tasarımların "
+                       "standardıdır; balıkgözü ve ölçüm objektifleri "
+                       "genelde equidistant (r = f·θ) haritalar.")
+        self.lbl_proj = QLabel("—")
+        self.lbl_proj.setWordWrap(True)
+        self.lbl_proj.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        ll.addWidget(self.lbl_proj, 8, 0, 1, 2)
+        for wdg in (self.f_focal, self.f_ufov):
+            wdg.valueChanged.connect(self._update_projection_label)
         lay.addWidget(gb_lens)
 
         # --- Dedektör ---
@@ -350,6 +415,8 @@ class MainWindow(QMainWindow):
         # Sensör boyutu canlı güncellensin
         for wdg in (self.f_det_w, self.f_det_h, self.f_pitch_x, self.f_pitch_y):
             wdg.valueChanged.connect(self._update_sensor_label)
+            # FOV dedektör ölçüsüne de bağlı — projeksiyon satırı takip etsin.
+            wdg.valueChanged.connect(self._update_projection_label)
 
         # Elle düzenleme seçiciyi "Özel"e düşürür (tek doğruluk kaynağı).
         for wdg in (self.f_focal, self.f_fnum, self.f_pupil):
@@ -427,6 +494,17 @@ class MainWindow(QMainWindow):
         pl.addWidget(btn_load)
         pl.addWidget(btn_reset)
         lay.addWidget(gb_pre)
+
+        # --- CANLI HESAP ---
+        # Sağ bar, sol panelden hesaplanabilen her şeyi ANINDA göstersin.
+        # Piksel sayıları (QSpinBox) ve projeksiyon modeli de FOV'u
+        # değiştirir; onları da bağlamak gerekiyor.
+        for alan in list(self.ALAN_DUGUM) + [
+                "f_det_w", "f_det_h", "f_oled_w", "f_oled_h"]:
+            w = getattr(self, alan, None)
+            if w is not None:
+                w.valueChanged.connect(self._canli_hesapla)
+        self.f_proj.activated.connect(self._canli_hesapla)
 
         # --- Analiz butonu ---
         self.btn_run = QPushButton("ANALİZ ET")
@@ -533,6 +611,19 @@ class MainWindow(QMainWindow):
             "ölçüm daha yapılır; sonuçlar sağdaki karşılaştırma tablosunda."),
             "Kırpma")
 
+        # Çözücü sekmesi — görüntü GEREKTİRMEZ. Ana akış "görüntü ver,
+        # ölçeyim" yönünde çalışır; bu sekme ters yöndür: "şu değerleri
+        # biliyorum, bilmediğimi bul". Bu yüzden analiz koşmadan da
+        # kullanılabilir ve buton durumlarına bağlı değildir.
+        self.tab_solver = SolverTab()
+        self.tab_solver.btn_panelden.clicked.connect(self._solver_panelden_doldur)
+        self.tabs.addTab(self.tab_solver, "Çözücü")
+        # Sekmedeki bir değer değişince sağ bardaki nominal değerler de
+        # tazelensin: sekme yalnız bir hesap makinesi değil, sistemin
+        # bilinenlerinin ikinci girdi yeri.
+        for le in self.tab_solver.fields.values():
+            le.textChanged.connect(self._canli_hesapla)
+
         # Görüntüye tıklayınca ROI merkezi oraya taşınsın.
         self.view_gt.clicked_at.connect(
             lambda x, y: self._roi_click("gt", x, y))
@@ -573,12 +664,109 @@ class MainWindow(QMainWindow):
         # ------------------------------------------------------------------
 
         # 1) FOV
+        #
+        # SIRALAMA KURALI: en üstte "sistemin FOV'u kaç?" sorusunun CEVABI
+        # durur, altına doğru o cevabın türetildiği ara veriler gelir. Sıra
+        # sabit değildir — `_fov_satir_sirala` sonuç geldiğinde hangi satırın
+        # cevap olduğuna göre yeniden dizer:
+        #
+        #   Daire sensörü KAPSIYOR   -> cevap geometrik FOV'dur (Yatay × Dikey)
+        #   Daire sensörden KÜÇÜK    -> cevap efektif FOV'dur; geometrik
+        #                               satırlar ara veriye düşer
+        #
+        # Bu ayrım kozmetik değil: Hydra'da geometrik köşegen 30.56°, gerçek
+        # FOV 21.50°. İkisi de doğru sayılardır ama yalnızca biri "sistemin
+        # FOV'u" sorusunun cevabıdır. Cevabı listenin en üstüne koymazsak
+        # kullanıcı ilk gördüğü satırı okur ve %42 yanlış değeri alır.
         gb_fov = QGroupBox("Görüş Alanı (FOV)")
-        fl = QVBoxLayout(gb_fov)
+        self._fov_layout = fl = QVBoxLayout(gb_fov)
+
+        # -- Cevap adayı A: lensin görüntü dairesiyle kırpılmış gerçek FOV.
+        # Yalnızca daire sensörden küçükken görünür ve o durumda EN ÜSTTEDİR.
+        self.r_fov_eff = ResultRow("Gerçekte görülen FOV", "°",
+                                   "Lensin görüntü dairesiyle kırpıldıktan "
+                                   "sonra sensörde gerçekten görüntü olan "
+                                   "alan — sistemin FOV'u budur. Daire "
+                                   "sensörü tamamen kapsıyorsa bu satır "
+                                   "gizlenir, cevap geometrik FOV olur.")
+        # -- Cevap adayı B: saf sensör geometrisi. Daire kapsıyorsa cevap
+        # budur; kapsamıyorsa ara veriye düşer ve MUTED yazılır.
         self.r_fov_xy = ResultRow("Yatay × Dikey", "°",
                                   "Sensörün gördüğü toplam açı.")
         self.r_fov_d = ResultRow("Köşegen", "°")
-        for r in (self.r_fov_xy, self.r_fov_d):
+        # -- Ara veri: cevabın nereden geldiğini gösteren büyüklükler.
+        self.r_fov_circle = ResultRow("Görüntü dairesi", "mm",
+                                      "Lensin ürettiği dairesel görüntünün "
+                                      "çapı. Sensör köşegeninden küçükse "
+                                      "köşeler karanlıktır (vignetting).")
+        # Kullanılabilir alan — dairenin sensörden ne kadarını doldurduğu.
+        # FOV'un tek sayıya inmesinin bedeli budur: Hydra'da piksellerin
+        # %24'ü karanlıktır ve yıldız arama o alanda boşuna çalışır.
+        self.r_fov_fill = ResultRow("Kullanılabilir alan", "",
+                                    "Görüntü dairesinin içinde kalan piksel "
+                                    "sayısı ve bunun tüm sensöre oranı. "
+                                    "Dışarıda kalan pikseller karanlıktır; "
+                                    "yıldız arama maskesi bu daireyle "
+                                    "sınırlanmalıdır.")
+        # "Projeksiyon" satırı PANELDEN KALDIRILDI.
+        #
+        # İki sorun vardı. Birincisi rozet: satır "datasheet" diye
+        # işaretleniyordu ama model datasheet'ten OKUNMUYOR — sol panelde
+        # seçilen (ve varsayılanı rektilineer olan) bir ayar. Rozet, ölçüm
+        # kaynağı hakkında yanlış beyandı.
+        #
+        # İkincisi gereklilik: model bir GİRDİ, sonuç değil. Sol panelde
+        # zaten görünür ve oradan değiştirilir; sonuç panelinde tekrar
+        # etmesi satır harcıyordu.
+        #
+        # Widget yaşıyor (`_show_results` onu dolduruyor, `_clear_results`
+        # temizliyor); yalnızca layout'a eklenmiyor.
+        self.r_fov_model = ResultRow("Projeksiyon", "",
+                                     "FOV'un hangi açı→yükseklik haritasıyla "
+                                     "hesaplandığı. Panelde gösterilmiyor; "
+                                     "sol panelden seçilir.")
+        # Layout'a girmeyen widget'ın ebeveyni olmalı, yoksa C++ tarafında
+        # silinir ve `_show_results` içindeki set_value çağrısı patlar.
+        self.r_fov_model.setParent(self)
+        self.r_fov_model.setVisible(False)
+        # Üreticinin verdiği FOV ile karşılaştırma — bağımsız bir sağlık
+        # göstergesi (§7C'deki useful FOV tutarlılığı).
+        self.r_fov_check = ResultRow("Üretici FOV ile", "",
+                                     "Hesaplanan tam-sensör FOV'unun üreticinin "
+                                     "kullanılabilir FOV'undan BÜYÜK çıkması "
+                                     "beklenen yöndür: useful FOV köşe kalitesi "
+                                     "düştüğü için dar tanımlanır.")
+        # --- ÖLÇÜMDEN gelen optik: bağımsız doğrulama ---
+        # Buraya kadarki her şey datasheet f'ine dayanır. Bu iki satır ise
+        # GÖRÜNTÜDEN gelir: hizalamanın ölçtüğü ölçek, referans ekranın
+        # açısal ölçeği biliniyorsa lensin odak uzaklığını verir. Datasheet
+        # ile ölçümün ayrışması odak kayması, montaj hatası ya da yanlış
+        # girilmiş bir parametre demektir — panelin başka hiçbir satırı
+        # bunu yakalayamaz.
+        self.r_focal_meas = ResultRow(
+            "Ölçülen f", "mm",
+            "Lensin odak uzaklığının GÖRÜNTÜDEN ölçülen değeri.\n\n"
+            "Hizalama, ground truth'un bir pikselinin dedektörde kaç piksele "
+            "düştüğünü ölçer (ölçek). Referans ekranın açısal ölçeği "
+            "biliniyorsa bu ölçek lensin f'ini verir:\n"
+            "   f_lens = ölçek × (f_ekran / pitch_ekran) × pitch_dedektör\n\n"
+            "Datasheet değeriyle karşılaştırılır; ayrışma gerçek bir "
+            "fiziksel farka işaret eder.\n\n"
+            "Yalnızca referans ekran AÇISAL KAYNAK ise (°/px girilmişse) ve "
+            "projeksiyon rektilineer ise hesaplanır.")
+        self.r_fov_meas = ResultRow(
+            "Ölçülen FOV", "°",
+            "Ölçülen odak uzaklığından çıkan FOV — yani sistemin gerçekte "
+            "gördüğü açı.\n\n"
+            "Yukarıdaki nominal FOV datasheet f'ine dayanır; bu satır "
+            "ölçüme dayanır. İkisi ayrışıyorsa raporlanacak olan budur.")
+        self.r_focal_meas.setVisible(False)
+        self.r_fov_meas.setVisible(False)
+
+        # Başlangıç sırası = daire kapsıyor hali (en yaygın durum).
+        for r in (self.r_fov_xy, self.r_fov_d, self.r_fov_eff,
+                  self.r_fov_circle, self.r_fov_fill, self.r_fov_check,
+                  self.r_focal_meas, self.r_fov_meas):
             fl.addWidget(r)
         lay.addWidget(gb_fov)
 
@@ -589,12 +777,52 @@ class MainWindow(QMainWindow):
                                 "Tek bir pikselin gördüğü açı — sistemin "
                                 "ayırt etme gücü.")
         self.r_ifov_as = ResultRow("", "arcsec")
-        for r in (self.r_ifov, self.r_ifov_as):
+        # Açısal çözünürlük = IFOV'un derece/piksel cinsinden yazılışı.
+        # Ayrı bir satır olmasının sebebi datasheet dili: üreticiler bu
+        # büyüklüğü genelde °/px olarak verir (STOS'un 0.027 °/px'i gibi),
+        # µrad değil. Aynı sayının iki dilde yazılışı — hangi birimde
+        # arıyorsa kullanıcı onu bulsun.
+        self.r_ang_res = ResultRow("Açısal çözünürlük", "°/px",
+                                   "IFOV'un derece/piksel cinsinden karşılığı. "
+                                   "Datasheet'ler açısal çözünürlüğü genelde "
+                                   "bu birimde verir.")
+        # Kenar pikselinin açısı — merkezdekinden farklıdır (rektilineerde
+        # daha küçük). Tek bir IFOV sayısının tüm alan için geçerli
+        # OLMADIĞINI gösterir; "FOV = N × IFOV" yaklaşımının neden kenarda
+        # bozulduğu doğrudan budur.
+        self.r_ifov_edge = ResultRow("Kenar pikseli", "µrad",
+                                     "Sensör kenarındaki pikselin gördüğü açı. "
+                                     "Rektilineer projeksiyonda merkezden "
+                                     "küçüktür; equidistant (f-theta) lenste "
+                                     "tanım gereği eşittir.")
+        for r in (self.r_ifov, self.r_ifov_as, self.r_ang_res,
+                  self.r_ifov_edge):
             il.addWidget(r)
         lay.addWidget(gb_ifov)
 
         # 3) Tilt
+        #
+        # "Eğiklik (Tilt)" GRUBU PANELDEN KALDIRILDI.
+        #
+        # Aynı büyüklük iki yerde okunuyordu: bu grup skaler eğikliği
+        # (1.366°), "Yönelim hataları"ndaki `Tilt (x / y)` ise aynı yatışın
+        # iki bileşenini (+0.055 / -0.043) yazıyordu. Kullanıcı için tek bir
+        # tilt kavramı var; iki farklı sayı görmek hangisinin "gerçek" tilt
+        # olduğu sorusunu doğuruyordu. Tilt artık YALNIZCA yönelim
+        # hatalarında.
+        #
+        # Bunun bedeli bilinçlidir: bu grubun taşıdığı ölçüm belirsizliği
+        # (± σ) ve "ölçüm sınırının altında / ölçülemedi" durumları artık
+        # panelde GÖSTERİLMİYOR. Ölçüm katmanı (tilt_estimators) çalışmaya
+        # devam ediyor, sonuç nesnesinde duruyor ve karşılaştırma tablosu
+        # onu okuyor — sadece bu panelde yer kaplamıyor.
+        #
+        # Widget'lar YOK EDİLMEDİ: `_clear_results`, karşılaştırma tablosu
+        # ve `_show_tilt` onlara başvuruyor. Geri istenirse layout'a
+        # eklemek yeterli.
         gb_tilt = QGroupBox("Eğiklik (Tilt)")
+        self.gb_tilt = gb_tilt
+        gb_tilt.setVisible(False)
         tl = QVBoxLayout(gb_tilt)
         # "Dönme (SIFT)" satırı PANELDEN KALDIRILDI.
         #
@@ -623,7 +851,12 @@ class MainWindow(QMainWindow):
         self.lbl_tilt_note.setWordWrap(True)
         self.lbl_tilt_note.setStyleSheet(f"color:{MUTED}; font-size:11px;")
         tl.addWidget(self.lbl_tilt_note)
-        lay.addWidget(gb_tilt)
+        # Grup layout'a EKLENMEZ (gizli; bkz. yukarıdaki gerekçe) ama bir
+        # ebeveyni OLMALI: sahipsiz bir QWidget Python tarafında referansı
+        # kalsa da C++ tarafında silinir ve `_show_tilt` içindeki
+        # setText çağrısı "wrapped C/C++ object has been deleted" ile
+        # patlar. Ana pencereye bağlayıp gizliyoruz.
+        gb_tilt.setParent(self)
 
         # 3B) Yönelim hataları — decenter / roll / tilt
         # Kaynağı yoğun hizalamanın homografisidir (core/pointing.py); ayrı
@@ -657,21 +890,46 @@ class MainWindow(QMainWindow):
         gb_cov = QGroupBox("FOV kapsaması")
         cl = QVBoxLayout(gb_cov)
         self.r_cov_pattern = ResultRow(
-            "Desenin görüneni", "%",
-            "Ground truth deseninin kaçta kaçı sensöre düşüyor.")
+            "Desenden kullanılan", "px",
+            "Desenin kaç pikseli sensöre düşüyor (kullanılan / bölgenin "
+            "toplamı). PAYDA EKRANIN TAMAMI DEĞİLDİR: cihaz referans "
+            "ekranın yalnızca ortasındaki daireyi görebilir (yarı-FOV'un "
+            "ekrandaki yarıçapı), dışarıdaki kenar hiçbir yönelimde ölçüme "
+            "girmez. Bölgenin nereden geldiği değerin yanında yazar. "
+            "Sayım GT'nin KENDİ çözünürlüğünde yapılır.")
         self.r_cov_sensor = ResultRow(
-            "Sensörün dolan kısmı", "%",
-            "Sensör alanının kaçta kaçı desenle kaplı.")
+            "Sensörden kullanılan", "px",
+            "Sensörün kaç pikseli desenle kaplı. Payda sensörün AYDINLIK "
+            "alanıdır (dikdörtgen ∩ lensin görüntü dairesi) — daire "
+            "sensörden küçükse köşeler karanlıktır ve hiçbir zaman "
+            "dolmaz, paydada durmaları yanıltıcı olur.")
+        # "Ulaşılan en büyük açı" satırı PANELDEN KALDIRILDI.
+        #
+        # FOV ile karışıyordu: 15.240° yazıyordu ve hemen üstteki panelde
+        # FOV 21.500° görünüyordu. İkisi karşılaştırılabilir sayılar DEĞİL —
+        # bu bir YARI-açı (eksenden ölçülü), FOV ise TAM açı. Yan yana
+        # okununca "FOV'un %71'i kullanılmış" gibi yanlış bir çıkarım
+        # doğuruyordu.
+        #
+        # Bilgi kaybı yok: aynı büyüklük "Kenar açıları" satırında zaten
+        # dört kenar için ayrı ayrı ve yarı-açı olduğu belli biçimde var.
         self.r_cov_maxang = ResultRow(
             "Ulaşılan en büyük açı", "°",
-            "Sensör köşesinin optik eksene göre açısı — pratikte görülen yarı-FOV.")
+            "Sensör köşesinin optik eksene göre açısı — pratikte görülen yarı-FOV. "
+            "Panelde gösterilmiyor; FOV ile karışıyordu.")
+        # Layout'a girmiyor; ebeveyni olmazsa C++ tarafında silinir.
+        self.r_cov_maxang.setParent(self)
+        self.r_cov_maxang.setVisible(False)
         self.r_cov_edges = ResultRow(
             "Kenar açıları", "°",
             "Sol / sağ / üst / alt kenarların açısı. Kırpılmış görüntüde asimetriktir.")
         self.r_cov_margin = ResultRow(
             "Desen payı", "px",
-            "Deseni tamamen görmek için kalan pay. Negatifse desen taşıyor.")
-        for r in (self.r_cov_pattern, self.r_cov_sensor, self.r_cov_maxang,
+            "Deseni tamamen görmek için kalan pay. Negatifse desen taşıyor. "
+            "Sınır iki tanedir — sensörün kenarı ve lensin görüntü dairesi; "
+            "hangisinin bağladığı değerin yanında yazar. Daire bağlıyorsa "
+            "daha büyük bir dedektör sorunu çözmez, lens değişmelidir.")
+        for r in (self.r_cov_pattern, self.r_cov_sensor,
                   self.r_cov_edges, self.r_cov_margin):
             cl.addWidget(r)
         lay.addWidget(gb_cov)
@@ -710,6 +968,14 @@ class MainWindow(QMainWindow):
         for r in (self.r_sensor, self.r_tilt_method, self.r_el_conf,
                   self.r_mirror, self.r_inliers, self.r_reproj):
             dl.addWidget(r)
+        # Yöntem notları: "şu ölçüm şu yolla yapıldı" bilgileri. Uyarı
+        # DEĞİLLER — ölçüm başarılıyken de yazılırlar, o yüzden Durum
+        # satırında değil burada dururlar.
+        self.lbl_details_notes = QLabel("")
+        self.lbl_details_notes.setWordWrap(True)
+        self.lbl_details_notes.setStyleSheet(f"color:{MUTED}; font-size:11px;")
+        self.lbl_details_notes.setVisible(False)
+        dl.addWidget(self.lbl_details_notes)
         self.details_box.setVisible(False)
         sl.addWidget(self.details_box)
         lay.addWidget(gb_st)
@@ -774,7 +1040,7 @@ class MainWindow(QMainWindow):
 
         lay.addStretch(1)
         scroll.setWidget(inner)
-        scroll.setMinimumWidth(320)
+        scroll.setMinimumWidth(380)
         return scroll
 
     # --------------------------- yardımcılar -------------------------------
@@ -785,12 +1051,15 @@ class MainWindow(QMainWindow):
         self.btn_details.setText("▾ Ayrıntılar" if checked else "▸ Ayrıntılar")
 
     def _dspin(self, lo, hi, dec, suffix) -> QDoubleSpinBox:
-        s = QDoubleSpinBox()
-        s.setRange(lo, hi)
-        s.setDecimals(dec)
-        s.setSuffix(suffix)
-        s.setButtonSymbols(QDoubleSpinBox.NoButtons)
-        return s
+        """
+        Sayı alanı — BOŞ BIRAKILABİLİR (boş = bilinmiyor).
+
+        `lo` artık yok sayılıyor: alt sınır her zaman 0'dır ve 0 "verilmedi"
+        demektir. Eskiden odak uzaklığının alt sınırı 1.0 mm idi; alanı
+        silmek imkânsızdı ve kullanıcı "bunu bilmiyorum, sen hesapla"
+        diyemiyordu. Boşluk bu projede BİLGİ taşır.
+        """
+        return BlankableDoubleSpin(hi, dec, suffix)
 
     def _ispin(self, lo, hi, suffix) -> QSpinBox:
         s = QSpinBox()
@@ -832,6 +1101,8 @@ class MainWindow(QMainWindow):
         self.f_fnum.setValue(item.f_number)
         self.f_pupil.setValue(item.pupil_diameter_mm)
         self.f_ufov.setValue(item.useful_fov_deg)
+        self.f_circle.setValue(getattr(item, "image_circle_mm", 0.0))
+        self._set_projection(item.projection)
         self._sync_catalog_selectors()
 
     def _apply_detector_preset(self):
@@ -862,6 +1133,68 @@ class MainWindow(QMainWindow):
         self.f_scr_ang.setValue(item.angular_res_deg)
         self._update_screen_label()
         self._sync_catalog_selectors()
+
+    def _set_projection(self, model: str):
+        """
+        Projeksiyon seçicisini ayarlar ve bilgi satırını tazeler.
+
+        Bilinmeyen bir model gelirse (elle düzenlenmiş preset) rektilineere
+        düşülür — seçicide boş/geçersiz bir kalem bırakmaktansa projenin
+        doğrulanmış varsayılanını göstermek doğru davranış.
+        """
+        idx = self.f_proj.findData(model)
+        if idx < 0:
+            idx = max(0, self.f_proj.findData(projmod.RECTILINEAR))
+        self.f_proj.blockSignals(True)
+        self.f_proj.setCurrentIndex(idx)
+        self.f_proj.blockSignals(False)
+        self._update_projection_label()
+
+    def _update_projection_label(self):
+        """
+        Seçili projeksiyon modelinin verdiği FOV'u ve diğer modellerle
+        farkını canlı gösterir.
+
+        Neden diğer modeller de yazılıyor: "FOV yanlış çıkıyor" şüphesinde
+        ilk soru "fark modelden mi gelebilir" olmalı. Yayılım küçükse sorun
+        modelde DEĞİLDİR ve başka yere bakmak gerekir — bu satır o ayrımı
+        tek bakışta yaptırır.
+        """
+        model = self.f_proj.currentData()
+        f = self.f_focal.value()
+        w_mm = self.f_det_w.value() * self.f_pitch_x.value() / 1000.0
+        h_mm = self.f_det_h.value() * self.f_pitch_y.value() / 1000.0
+        if f <= 0 or w_mm <= 0:
+            self.lbl_proj.setText("—")
+            return
+        fov_x = projmod.full_fov_deg(model, f, w_mm)
+        fov_y = projmod.full_fov_deg(model, f, h_mm)
+        diag = projmod.full_fov_deg(model, f, math.hypot(w_mm, h_mm))
+        if not math.isfinite(fov_x):
+            self.lbl_proj.setText(
+                "Bu sensör ölçüsü seçili modelin tanım aralığı dışında — "
+                "FOV hesaplanamıyor.")
+            return
+        txt = (f"FOV {fov_x:.3f}° × {fov_y:.3f}°  ·  köşegen {diag:.3f}°")
+
+        # Model yayılımı: aynı donanımda diğer modeller ne verirdi.
+        hepsi = [v for _, v in projmod.compare_models(f, w_mm)
+                 if math.isfinite(v)]
+        if len(hepsi) >= 2:
+            yayilim = max(hepsi) - min(hepsi)
+            txt += (f"  ·  model yayılımı {min(hepsi):.3f}–{max(hepsi):.3f}° "
+                    f"({yayilim:.3f}°)")
+
+        # Üretici FOV'u ile karşılaştırma: hesaplanan tam-sensör FOV'unun
+        # üreticinin "useful FOV"undan büyük çıkması BEKLENEN yöndür (köşe
+        # kalitesi düştüğü için useful dar tanımlanır). Ters yön şüphelidir.
+        ufov = self.f_ufov.value()
+        if ufov > 0:
+            fark = (fov_x - ufov) / ufov * 100.0
+            yon = "hesaplanan büyük (beklenen yön)" if fark > 0 \
+                else "DİKKAT: hesaplanan üretici FOV'undan DAR"
+            txt += f"  ·  üretici {ufov:.2f}° → %{abs(fark):.2f} {yon}"
+        self.lbl_proj.setText(txt)
 
     def _update_screen_label(self):
         """
@@ -907,6 +1240,8 @@ class MainWindow(QMainWindow):
         self.f_fnum.setValue(cfg.lens.f_number)
         self.f_pupil.setValue(cfg.lens.pupil_diameter_mm)
         self.f_ufov.setValue(cfg.lens.useful_fov_deg)
+        self.f_circle.setValue(getattr(cfg.lens, "image_circle_mm", 0.0))
+        self._set_projection(cfg.lens.projection)
         self.f_det_name.setText(cfg.detector.name)
         self.f_det_w.setValue(cfg.detector.width_px)
         self.f_det_h.setValue(cfg.detector.height_px)
@@ -921,6 +1256,8 @@ class MainWindow(QMainWindow):
         self.f_oled_aw.setValue(cfg.oled.active_width_mm)
         self.f_oled_ah.setValue(cfg.oled.active_height_mm)
         self.f_scr_ang.setValue(cfg.oled.angular_res_deg)
+        self._bastan_bos_guncelle()
+        self._canli_hesapla()
         self._update_screen_label()
         self._sync_catalog_selectors()
 
@@ -972,6 +1309,9 @@ class MainWindow(QMainWindow):
         self.f_fnum.setValue(cfg.lens.f_number)
         self.f_pupil.setValue(cfg.lens.pupil_diameter_mm)
         self.f_ufov.setValue(cfg.lens.useful_fov_deg)
+        self.f_circle.setValue(getattr(cfg.lens, "image_circle_mm", 0.0))
+        self._set_projection(getattr(cfg.lens, "projection",
+                                     projmod.RECTILINEAR))
 
         self.f_det_name.setText(cfg.detector.name)
         self.f_det_w.setValue(cfg.detector.width_px)
@@ -986,6 +1326,8 @@ class MainWindow(QMainWindow):
         self.f_oled_aw.setValue(cfg.oled.active_width_mm)
         self.f_oled_ah.setValue(cfg.oled.active_height_mm)
         self.f_scr_ang.setValue(getattr(cfg.oled, "angular_res_deg", 0.0))
+        self._bastan_bos_guncelle()
+        self._canli_hesapla()
         self._update_screen_label()
 
         idx = self.f_setup.findData(cfg.setup_type)
@@ -1005,6 +1347,8 @@ class MainWindow(QMainWindow):
                 f_number=self.f_fnum.value(),
                 pupil_diameter_mm=self.f_pupil.value(),
                 useful_fov_deg=self.f_ufov.value(),
+                image_circle_mm=self.f_circle.value(),
+                projection=self.f_proj.currentData(),
             ),
             detector=Detector(
                 name=self.f_det_name.text(),
@@ -1023,6 +1367,331 @@ class MainWindow(QMainWindow):
                 angular_res_deg=self.f_scr_ang.value(),
             ),
         )
+
+    # ------------------ boş alanların çözücüyle doldurulması ---------------
+
+    # Sol paneldeki alan  ->  çözücü düğümü. Yalnızca çözücünün türetebildiği
+    # büyüklükler burada; isim/model gibi metin alanları yok.
+    # Sınıf sözlüğü örneğe kopyalanarak bağlanır (bkz. `__init__`).
+    ALAN_DUGUM: dict[str, str] = {
+        "f_focal": "lens_f_mm",
+        "f_fnum": "lens_fnum",
+        "f_pupil": "lens_pupil_mm",
+        "f_ufov": "lens_useful_fov_deg",
+        "f_circle": "lens_image_circle_mm",
+        "f_pitch_x": "det_pitch_um",
+        "f_pitch_y": "det_pitch_y_um",
+        "f_oled_pitch": "scr_pitch_um",
+        "f_oled_aw": "scr_aw_mm",
+        "f_oled_ah": "scr_ah_mm",
+        "f_scr_ang": "scr_ang_deg",
+    }
+
+    def _olculen_optigi_yaz(self, res):
+        """
+        Görüntüden ölçülen odak uzaklığını ve ondan çıkan FOV'u yazar.
+
+        Panelin geri kalanı datasheet f'ine dayanır; bu iki satır ÖLÇÜME
+        dayanır ve bağımsız bir doğrulamadır. Ayrışma varsa fiziksel bir
+        sebebi vardır (odak kayması, montaj, yanlış parametre) ve panelin
+        başka hiçbir satırı bunu yakalayamaz.
+
+        Ölçüm yoksa satırlar GİZLENİR — boş bir "—" göstermek, hesaplanmış
+        ama sonuçsuz kalmış izlenimi verirdi; oysa koşul hiç sağlanmamıştır.
+        """
+        p = getattr(res, "pointing", None)
+        fm = getattr(p, "measured_focal_mm", float("nan")) if p else float("nan")
+        if not (p is not None and math.isfinite(fm) and fm > 0):
+            self.r_focal_meas.clear()
+            self.r_fov_meas.clear()
+            self.r_focal_meas.setVisible(False)
+            self.r_fov_meas.setVisible(False)
+            return
+
+        self.r_focal_meas.setVisible(True)
+        self.r_fov_meas.setVisible(True)
+
+        f_ds = self.f_focal.value()
+        hata = getattr(p, "focal_error_pct", float("nan"))
+        # Eşik %2: datasheet yuvarlamaları ve hizalamanın kendi hatası bu
+        # aralığa sığar; gerçek bir odak kayması sığmaz.
+        iyi = math.isfinite(hata) and abs(hata) < 2.0
+        if math.isfinite(hata) and f_ds > 0:
+            self.r_focal_meas.set_value(
+                f"{fm:.3f}   (%{hata:+.2f})", GOOD if iyi else WARN)
+            aciklama = (
+                f"Görüntüden ölçüldü: {fm:.4f} mm\n"
+                f"Datasheet değeri:   {f_ds:.4f} mm\n"
+                f"Fark: %{hata:+.2f}\n\n")
+            aciklama += (
+                "Ölçüm datasheet ile uyumlu — lens beklenen yerde "
+                "odaklanıyor ve girilen parametreler tutarlı."
+                if iyi else
+                "AYRIŞMA VAR. Olası sebepler: lens odak kaymış, sensör "
+                "beklenen mesafede değil, ya da girilen piksel pitch'i / "
+                "ekran açısal çözünürlüğü yanlış.\n\n"
+                "Hangisinin yanlış olduğunu bu ölçüm tek başına söylemez; "
+                "ama bir şeyin yanlış olduğunu söyler.")
+        else:
+            self.r_focal_meas.set_value(f"{fm:.3f}", ACCENT)
+            aciklama = f"Görüntüden ölçüldü: {fm:.4f} mm"
+        # Bağıntı SAYILARLA yazılır: hangi değerlerden, hangi işlemle.
+        p_ = getattr(res, "pointing", None)
+        olcek = getattr(p_, "measured_scale", float("nan")) if p_ else float("nan")
+        f_ekr = getattr(p_, "screen_implied_focal_mm", float("nan")) if p_ else float("nan")
+        p_ekr = self.f_oled_pitch.value()
+        p_det = self.f_pitch_x.value()
+        if all(math.isfinite(x) and x > 0 for x in (olcek, f_ekr, p_ekr, p_det)):
+            baginti = (
+                "\n\nBağıntı:\n"
+                "   f = ölçek × (f_ekran / pitch_ekran) × pitch_dedektör\n"
+                f"     = {olcek:.5f} × ({f_ekr:.4f} mm / {p_ekr:.4f} µm)"
+                f" × {p_det:.4f} µm\n"
+                f"     = {fm:.4f} mm")
+        else:
+            baginti = ("\n\nBağıntı:\n"
+                       "   f = ölçek × (f_ekran / pitch_ekran) × pitch_dedektör")
+        self.r_focal_meas.set_source("measured", aciklama + baginti)
+
+        fov_m = getattr(p, "measured_fov_x_deg", float("nan"))
+        if math.isfinite(fov_m) and fov_m > 0:
+            nominal = getattr(res.fov, "fov_x_deg", float("nan"))
+            self.r_fov_meas.set_value(f"{fov_m:.3f}", GOOD if iyi else WARN)
+            ek = ""
+            if math.isfinite(nominal) and nominal > 0:
+                d = (fov_m - nominal) / nominal * 100.0
+                ek = (f"\n\nNominal (datasheet f'inden): {nominal:.3f}°\n"
+                      f"Fark: %{d:+.2f}")
+            # Her satır HANGİ BAĞINTIYLA hesaplandığını göstermeli;
+            # "türetildi/ölçüldü" demek yetmiyor, formülü de görünmeli.
+            boyut = getattr(res.fov, "sensor_w_mm", float("nan"))
+            bagintI = (f"\n\nBağıntı:\n"
+                       f"   FOV = 2·atan( boyut / 2f )\n"
+                       f"       = 2·atan( {boyut:.4f} mm / (2 × {fm:.4f} mm) )\n"
+                       f"       = {fov_m:.4f}°"
+                       if math.isfinite(boyut) else "")
+            self.r_fov_meas.set_source(
+                "measured",
+                f"Ölçülen odak uzaklığından ({fm:.3f} mm) çıkan FOV."
+                + bagintI + ek
+                + "\n\nİkisi ayrışıyorsa raporlanacak olan BUDUR — ölçüm "
+                  "gerçek sistemi, nominal ise girilen parametreleri anlatır.")
+        else:
+            self.r_fov_meas.clear()
+            self.r_fov_meas.setVisible(False)
+
+    def _canli_hesapla(self):
+        """
+        Sol panel değişince sağ barı ANINDA tazeler.
+
+        NEDEN: FOV, IFOV, sensör ölçüsü ve türevleri GÖRÜNTÜ GEREKTİRMEZ —
+        hepsi donanım parametrelerinden çıkar. Buna rağmen sağ bar analiz
+        koşulana kadar boş duruyordu; kullanıcı hesaplanabilecek bir şeyi
+        görmek için önce iki görüntü seçmek zorundaydı.
+
+        Boş bırakılan alanlar da burada çözülür: bir değeri silmek
+        "bunu bilmiyorum" demektir ve türetilebiliyorsa sağ barda yine
+        görünür. Ayrı bir "hesapla" butonuna gerek yok.
+
+        Analiz koşulduktan sonra ÇALIŞMAZ: ölçüm sonucu nominal hesaptan
+        üstündür ve üzerine yazılmamalıdır.
+        """
+        if getattr(self, "_analiz_sonucu_var", False):
+            return
+        try:
+            cfg = self._config_from_fields()
+        except Exception:
+            self._clear_results()
+            return
+
+        # Boş alanları önce çöz: f'i silen kullanıcı sağ barda "nan"
+        # görmemeli — f, girdiği FOV'dan ya da pupil × f#'ten türetilebilir.
+        try:
+            cfg = self._eksikleri_tamamla(cfg)
+        except Exception:
+            pass
+
+        try:
+            fov = optics.compute_fov(cfg)
+        except Exception:
+            self._clear_results()
+            return
+        # Zincir kapanmadıysa "nan" bir sonuç değildir; boş göster ve nedeni
+        # söyle.
+        if not math.isfinite(getattr(fov, "fov_x_deg", float("nan"))):
+            self._clear_results()
+            self.lbl_verdict.setText(
+                "Nominal değerler için yeterli bilgi yok. Odak uzaklığı ve "
+                "dedektör ölçüleri girilmeli — ya da bunları türetecek bir "
+                "büyüklük (FOV, IFOV) «Ölçülen / bilinen büyüklükler» "
+                "grubuna yazılmalı.")
+            self.lbl_verdict.setStyleSheet(f"color:{MUTED}; font-size:13px;")
+            return
+
+        res = pipeline.AnalysisResult(fov=fov)
+        try:
+            self._show_results(res)
+        except Exception:
+            self._clear_results()
+            return
+
+        # ÖLÇÜME dayanan satırlar "ölçülemedi" DEMEMELİ: analiz denenmedi
+        # ki başarısız olsun. Öyle yazmak kullanıcıyı olmayan bir sorunu
+        # aramaya gönderir.
+        for r in (self.r_rot, self.r_tilt, self.r_decenter,
+                  self.r_decenter_px, self.r_roll, self.r_ptilt,
+                  self.r_mirror, self.r_inliers, self.r_reproj,
+                  self.r_el_conf, self.r_tilt_method,
+                  self.r_cov_pattern, self.r_cov_sensor, self.r_cov_maxang,
+                  self.r_cov_edges, self.r_cov_margin):
+            r.set_value("—", MUTED)
+            r.set_source(None)
+        self.lbl_verdict.setText(
+            "Nominal değerler donanımdan hesaplandı. Eğiklik, yönelim ve "
+            "kapsama için iki görüntü seçip ANALİZ ET deyin.")
+        self.lbl_verdict.setStyleSheet(f"color:{MUTED}; font-size:13px;")
+        self.lbl_tilt_note.setText("")
+        self.lbl_point_note.setText("")
+
+    def _eksikleri_tamamla(self, cfg):
+        """
+        Boş bırakılan alanları çözücüyle doldurulmuş bir KOPYA döndürür.
+        Panele yazmaz.
+
+        Panele yazmamak kasıtlı: kullanıcı bir alanı boş bıraktıysa o alan
+        boş kalmalı — "bunu bilmiyorum" demenin yolu bu. Ama sağ barın o
+        yüzden boş kalması gerekmiyor.
+        """
+        bos = [d for d in self._bos_alanlar() if d not in self._bastan_bos]
+        if not bos:
+            return cfg
+        res = solver.solve_for(self._panel_bilinenleri(), bos,
+                               model=self.f_proj.currentData())
+        import copy
+        yeni = copy.deepcopy(cfg)
+        # Yalnızca `compute_fov`'un okuduğu alanlar.
+        ATAMA = {
+            "lens_f_mm": ("lens", "focal_length_mm"),
+            "lens_fnum": ("lens", "f_number"),
+            "lens_pupil_mm": ("lens", "pupil_diameter_mm"),
+            "lens_useful_fov_deg": ("lens", "useful_fov_deg"),
+            "lens_image_circle_mm": ("lens", "image_circle_mm"),
+            "det_pitch_um": ("detector", "pixel_pitch_um"),
+            "det_pitch_y_um": ("detector", "pixel_pitch_y_um"),
+            "scr_pitch_um": ("oled", "pixel_pitch_um"),
+            "scr_ang_deg": ("oled", "angular_res_deg"),
+        }
+        for dugum in bos:
+            v = res.values.get(dugum)
+            hedef = ATAMA.get(dugum)
+            if v is None or hedef is None:
+                continue
+            setattr(getattr(yeni, hedef[0]), hedef[1], float(v.value))
+        return yeni
+
+    def _bastan_bos_guncelle(self):
+        """
+        Preset yüklendiğinde hangi alanların zaten boş geldiğini kaydeder.
+
+        Bu ayrım olmadan "boş alan" iki farklı şeyi karıştırır: kullanıcının
+        bilerek sildiği alan ile, o sistemde zaten kullanılmayan alan
+        (pasif panelde açısal çözünürlük gibi).
+        """
+        self._bastan_bos = set(self._bos_alanlar())
+
+    def _bos_alanlar(self) -> list[str]:
+        """Kullanıcının boş bıraktığı (= bilinmiyor) alanların düğüm adları."""
+        bos = []
+        for alan, dugum in self.ALAN_DUGUM.items():
+            w = getattr(self, alan, None)
+            if w is not None and w.value() <= 0:
+                bos.append(dugum)
+        return bos
+
+    def _panel_bilinenleri(self) -> dict[str, float]:
+        """
+        Sol panelde GERÇEKTEN girilmiş değerler + ölçümden gelenler.
+
+        `solver.from_config` kullanılmıyor çünkü o, boş bırakılan alanları
+        da (0 olarak) eleyip geçiyor ama ölçüm sonuçlarını hiç bilmiyor.
+        Burada ikisi birleşiyor: kullanıcının girdiği + analizin ölçtüğü.
+        """
+        g: dict[str, float] = {}
+        for alan, dugum in self.ALAN_DUGUM.items():
+            w = getattr(self, alan, None)
+            if w is not None and w.value() > 0:
+                g[dugum] = float(w.value())
+        # Piksel sayıları QSpinBox — boş bırakılamaz, hep bilinen sayılır.
+        for alan, dugum in (("f_det_w", "det_w_px"), ("f_det_h", "det_h_px"),
+                            ("f_oled_w", "scr_w_px"), ("f_oled_h", "scr_h_px")):
+            w = getattr(self, alan, None)
+            if w is not None and w.value() > 0:
+                g[dugum] = float(w.value())
+
+        # ÇÖZÜCÜ SEKMESİNDEKİ girdiler de bilinen sayılır.
+        # Sol panel yalnızca DONANIMI tutar (f, pitch, piksel sayısı);
+        # FOV, IFOV, ekran ölçeği gibi büyüklüklerin oradaki karşılıkları
+        # kaldırıldı, çünkü 12 boş kutu paneli dolduruyordu ve asıl
+        # girilecek alanı gizliyordu. O büyüklükler artık Çözücü
+        # sekmesinde giriliyor — ama orada kalırlarsa sekme yalnızca bir
+        # hesap makinesi olurdu. Buraya katarak sağ bardaki nominal
+        # değerleri de besliyorlar: "FOV'u biliyorum, f'i sil" akışı
+        # çalışmaya devam ediyor.
+        #
+        # Sol panel ÖNCELİKLİDİR: aynı büyüklük her ikisinde de doluysa
+        # panelin değeri kalır (`setdefault`). Panel donanımın kayıtlı
+        # tanımıdır; sekme geçici bir denemedir.
+        tab = getattr(self, "tab_solver", None)
+        if tab is not None:
+            try:
+                for dugum, deger in tab.girdiler().items():
+                    g.setdefault(dugum, deger)
+            except Exception:
+                pass
+        return g
+
+    def _olculen_dugumler(self) -> dict[str, float]:
+        """
+        GERÇEKTEN ÖLÇÜLMÜŞ büyüklükler — analiz koşulduysa.
+
+        DİKKAT: `_son_res` analiz koşulmadan da doludur; canlı hesap onu
+        nominal değerlerle doldurur. O değerler ÖLÇÜM DEĞİLDİR, donanımdan
+        türetilmiştir. Ayırmazsak çözücü sekmesi nominal FOV'u "girdi"
+        sanar ve kullanıcı FOV alanını silince onu türetmek yerine geri
+        yazar — yani "boş bırak, hesaplasın" akışı sessizce bozulur.
+        """
+        out: dict[str, float] = {}
+        if not getattr(self, "_analiz_sonucu_var", False):
+            return out
+
+        # FOV/IFOV BURAYA GİRMEZ.
+        #
+        # `res.fov` analiz sonrası da `compute_fov(cfg)` çıktısıdır — yani
+        # f ve pitch'ten TÜRETİLMİŞ nominal değer, ölçüm değil. Bunları
+        # "ölçüldü" diye çözücüye girdi olarak vermek iki hata yapar:
+        #   1. Sekmede FOV "girdi" görünür; kullanıcı alanı silse bile
+        #      geri yazılır ve "boş bırak, hesaplasın" akışı bozulur.
+        #   2. Çözücü onları dokunulmaz sayar; oysa f'ten türetilmişlerdir
+        #      ve f değişince değişmeleri gerekir.
+        #
+        # Analizin GERÇEKTEN ölçtüğü optik büyüklük tektir: ölçek.
+        # Ondan türetilen f ve FOV `lens_f_measured_mm` /
+        # `fov_measured_x_deg` düğümlerine düşer — nominal olanlarla
+        # karışmadan, ayrı satırlarda.
+
+        # Hizalamanın ölçtüğü ölçek — `scale_expected` DEĞİL. Beklenen ölçek
+        # donanımdan türetilir; bu görüntüden gelir ve ikisinin farkı asıl
+        # bilgidir. Aynı düğüme yazılsalardı çözücü kendi türettiğini ölçüm
+        # sanardı.
+        p = getattr(self._son_res, "pointing", None) if self._son_res else None
+        sc = getattr(p, "measured_scale", None) if p else None
+        try:
+            sc = float(sc)
+        except (TypeError, ValueError):
+            sc = None
+        if sc is not None and math.isfinite(sc) and sc > 0:
+            out["scale_measured"] = sc
+        return out
 
     # ---------------------------- eylemler ---------------------------------
 
@@ -1258,6 +1927,10 @@ class MainWindow(QMainWindow):
         self.progress.setVisible(False)
         self.result = res
         self.roi_result = roi_res
+        # Bundan sonra sağ bar ÖLÇÜMÜ gösterir; sol paneldeki bir alan
+        # değişse bile canlı (nominal) hesap onun üzerine yazmaz. Ölçüm
+        # görüntüden gelir ve nominal hesaptan üstündür.
+        self._analiz_sonucu_var = True
         self._show_results(res)
         self._show_comparison(res, roi_res)
 
@@ -1398,6 +2071,119 @@ class MainWindow(QMainWindow):
             f"font-size:11px;")
         self.gb_cmp.setVisible(True)
 
+    def _fov_doluluk_yaz(self, f, daire_mm: float):
+        """
+        Görüntü dairesinin sensörün ne kadarını doldurduğunu yazar.
+
+        FOV'un tek sayıya inmesinin bedeli budur ve FOV'dan bağımsız bir
+        bilgidir: Hydra'da FOV 21.50°'dir ama bunu 1024² pikselin tamamıyla
+        değil, içine sığan ~1006 px çaplı diskle elde eder. Dışarıda kalan
+        ~%24 karanlıktır — yıldız arama maskesi bu daireyle sınırlanmazsa
+        o alanda boşuna çalışır.
+
+        Alan hesabı dairenin sensöre sığan kısmıdır. Daire sensörün
+        kenarından küçükse (Hydra) bu tam bir dairedir: π/4 · (Ø/pitch)².
+        Kenardan büyük ama köşegenden küçükse daire kenarlardan taşar ve
+        kesişim alanı daire değil, kesilmiş dairedir — o durumda yalnızca
+        köşeler eksiktir, oranı ayrı hesaplamak gerekir.
+        """
+        # Pitch eksene göre farklı olabilir; piksel sayısına çevirirken
+        # her ekseni kendi pitch'iyle böl (px alanı = pitch_x · pitch_y).
+        px_x_mm = self.f_pitch_x.value() / 1000.0
+        px_y_mm = self.f_pitch_y.value() / 1000.0
+        if not (math.isfinite(daire_mm) and px_x_mm > 0 and px_y_mm > 0):
+            self.r_fov_fill.clear()
+            self.r_fov_fill.setVisible(False)
+            return
+        self.r_fov_fill.setVisible(True)
+        px_alan_mm2 = px_x_mm * px_y_mm
+        r_mm = daire_mm / 2.0
+        w, h = f.sensor_w_mm, f.sensor_h_mm
+        toplam_px = (w / px_x_mm) * (h / px_y_mm)
+        if r_mm <= min(w, h) / 2.0:
+            # Daire tamamen sensörün içinde — kullanılabilir alan tam daire.
+            alan_mm2 = math.pi * r_mm * r_mm
+            cap_x_px = daire_mm / px_x_mm
+            detay = (f"Daire sensörün içinde kalıyor; kullanılabilir alan "
+                     f"tam bir disk.\n\n"
+                     f"   çap = {daire_mm:.3f} mm / {px_x_mm * 1000:.1f} µm "
+                     f"= {cap_x_px:.1f} px\n"
+                     f"   alan = π/4 · {cap_x_px:.1f}² = "
+                     f"{alan_mm2 / px_alan_mm2:,.0f} px")
+        else:
+            # Daire kenarlardan taşıyor: sensör ∩ daire. Dairesel kesme
+            # (circular segment) alanlarını dört kenardan düşerek bul.
+            alan_mm2 = math.pi * r_mm * r_mm
+            for yari in (w / 2.0, h / 2.0):
+                if yari < r_mm:
+                    # Kenarın dışında kalan iki kesme (üst+alt / sol+sağ).
+                    aci = math.acos(yari / r_mm)
+                    segment = r_mm * r_mm * (aci - math.sin(2 * aci) / 2.0)
+                    alan_mm2 -= 2.0 * segment
+            detay = ("Daire sensörün kenarlarından taşıyor; kullanılabilir "
+                     "alan sensör ∩ daire kesişimidir (yalnızca köşeler "
+                     "eksik).")
+        kullanilabilir_px = alan_mm2 / px_alan_mm2
+        oran = kullanilabilir_px / toplam_px if toplam_px > 0 else float("nan")
+        # %90'ın altı gerçek bir kayıptır; maskeleme yapılmazsa yıldız
+        # arama boş alanda çalışır.
+        renk = WARN if oran < 0.90 else GOOD
+        self.r_fov_fill.set_value(
+            f"{kullanilabilir_px:,.0f} px  ·  %{oran * 100:.1f}", renk)
+        self.r_fov_fill.set_source(
+            "derived",
+            "Görüntü dairesinin içinde kalan piksel sayısı ve bunun tüm "
+            "sensöre oranı.\n\n"
+            f"{detay}\n\n"
+            f"Sensörün toplamı {toplam_px:,.0f} px; dışarıda kalan "
+            f"%{(1 - oran) * 100:.1f} karanlıktır. Yıldız arama / centroid "
+            "maskesi bu daireyle sınırlanmalıdır.")
+
+    def _fov_satir_sirala(self, daire_kisitli: bool):
+        """
+        FOV panelindeki satırları ÖNEM sırasına dizer: en üstte sistemin
+        FOV'u, altında o cevabın türetildiği ara veriler.
+
+        Sıranın sabit olmamasının sebebi, "cevap" satırının sisteme göre
+        değişmesidir. Lensin görüntü dairesi sensörü kapsıyorsa cevap saf
+        geometridir (Yatay × Dikey). Daire sensörden küçükse köşeler
+        karanlıktır; geometrik sayı hâlâ doğrudur ama artık cevap değildir,
+        ara veridir — cevap efektif FOV'a geçer.
+
+        Hydra'da fark somut: geometrik köşegen 30.56°, gerçek FOV 21.50°.
+        Sabit sırada geometrik satırlar üstte kalırdı ve kullanıcı ilk
+        gördüğü sayıyı okurdu.
+        """
+        # Ölçümden gelen satırlar HER İKİ dizilişte de sonda durur: onlar
+        # nominal hesabın alternatifi değil, DOĞRULAMASIDIR. Listeye dahil
+        # edilmezlerse `removeWidget`/`addWidget` turunda layout'tan düşer
+        # ve `setVisible(True)` dense bile görünmezler.
+        olcum = (self.r_focal_meas, self.r_fov_meas)
+        if daire_kisitli:
+            sira = (self.r_fov_eff,       # CEVAP
+                    self.r_fov_circle,    # cevabı belirleyen kısıt
+                    self.r_fov_fill,      # kısıtın bedeli
+                    self.r_fov_xy,        # ara veri: saf geometri
+                    self.r_fov_d,
+                    self.r_fov_check) + olcum
+        else:
+            sira = (self.r_fov_xy,        # CEVAP
+                    self.r_fov_d,
+                    self.r_fov_eff,       # gizli (kapsıyorsa aynı sayı)
+                    self.r_fov_circle,
+                    self.r_fov_fill,
+                    self.r_fov_check) + olcum
+        # Sıra zaten doğruysa layout'a dokunma — her sonuçta widget
+        # söküp takmak gereksiz yeniden çizim demektir.
+        mevcut = [self._fov_layout.itemAt(i).widget()
+                  for i in range(self._fov_layout.count())]
+        if mevcut == list(sira):
+            return
+        for r in sira:
+            self._fov_layout.removeWidget(r)
+        for r in sira:
+            self._fov_layout.addWidget(r)
+
     def _clear_results(self):
         for r in (self.r_fov_xy, self.r_fov_d,
                   self.r_ifov, self.r_ifov_as,
@@ -1406,7 +2192,10 @@ class MainWindow(QMainWindow):
                   self.r_mirror, self.r_inliers, self.r_reproj,
                   self.r_decenter, self.r_decenter_px, self.r_roll, self.r_ptilt,
                   self.r_cov_pattern, self.r_cov_sensor, self.r_cov_maxang,
-                  self.r_cov_edges, self.r_cov_margin):
+                  self.r_cov_edges, self.r_cov_margin,
+                  self.r_ang_res, self.r_ifov_edge,
+                  self.r_fov_model, self.r_fov_check,
+                  self.r_fov_eff, self.r_fov_circle, self.r_fov_fill):
             r.clear()
         self.lbl_tilt_note.setText("")
         self.lbl_point_note.setText("")
@@ -1417,13 +2206,259 @@ class MainWindow(QMainWindow):
             v_full.setText("—")
             v_roi.setText("—")
 
+        # --- Satırların DURUMUNU da başlangıca döndür ---
+        # Değeri temizlemek yetmiyor: `_show_results` satır etiketlerini
+        # yeniden adlandırıyor ("Yatay × Dikey" -> "Geometrik Y × D"),
+        # bazılarını gösterip gizliyor ve FOV bloğunun sırasını değiştiriyor.
+        # Bunlar geri alınmazsa açılıştaki sağ bar ile analizden sonraki
+        # sağ bar farklı görünür — aynı boş tabloyu iki ayrı biçimde
+        # gösterir. Temizlik, değeri değil DURUMU da kapsamalı.
+        self.r_fov_xy.set_label("Yatay × Dikey")
+        self.r_fov_d.set_label("Köşegen")
+        self.r_ifov_edge.set_label("Kenar pikseli")
+        for r in (self.r_fov_eff, self.r_fov_circle, self.r_fov_fill,
+                  self.r_fov_model, self.r_cov_maxang,
+                  self.r_focal_meas, self.r_fov_meas):
+            r.setVisible(False)
+        self._fov_satir_sirala(False)
+        self.gb_tilt.setVisible(False)
+        self.lbl_details_notes.setVisible(False)
+        self.details_box.setVisible(False)
+        self.btn_details.setChecked(False)
+
+    def _solver_panelden_doldur(self):
+        """
+        Sol paneldeki donanım değerlerini Çözücü sekmesine kopyalar.
+
+        `solver.from_config` ile AYNI kaynağı kullanır — panel ile çözücü
+        arasında ikinci bir dönüşüm tablosu tutmamak için. İkinci bir tablo
+        olsaydı biri güncellenip diğeri unutulduğunda sessizce ayrışırdı
+        (§5'teki panel↔tablo dersinin aynısı).
+        """
+        try:
+            cfg = self._config_from_fields()
+        except Exception as e:
+            QMessageBox.warning(self, "Doldurulamadı",
+                                f"Panel değerleri okunamadı:\n{e}")
+            return
+        # Donanım + ANALİZDEN GELEN ÖLÇÜMLER. Yalnızca `from_config`
+        # kullanılsaydı sekme ölçülen ölçeği hiç görmezdi ve "Ölçülen f"
+        # panelde dolu olduğu hâlde çözücüde boş kalırdı — kullanıcı
+        # sağda gördüğü sayıyı solda bulamazdı.
+        degerler = solver.from_config(cfg)
+        degerler.update(self._olculen_dugumler())
+        self.tab_solver.doldur(degerler)
+        # Projeksiyon modeli de panelden gelsin; FOV<->f bağıntısı ona bağlı.
+        model = getattr(cfg.lens, "projection", "rectilinear")
+        idx = self.tab_solver.cmb_model.findData(model)
+        if idx >= 0:
+            self.tab_solver.cmb_model.setCurrentIndex(idx)
+
+    def _solver_sources(self):
+        """
+        Panelde gösterilen büyüklüklerin kaynağını çözücüden alır.
+
+        Dönen: {düğüm_adı: (kind, açıklama)} — `kind` "given" ya da
+        "derived", açıklama da rozetin ipucu metni (türetim zinciri).
+
+        Neden çözücüden: hangi sayının datasheet'ten okunduğu, hangisinin
+        hesaplandığı TEK YERDE bilinmeli. Panel kendi başına "bu türetilmiş"
+        diye karar verseydi, çözücüyle ayrışan ikinci bir doğruluk kaynağı
+        doğardı — §5'teki panel↔tablo ayrışmasının aynısı.
+        """
+        try:
+            # `solve_config` DEĞİL: o yalnızca SystemConfig'in bildiği
+            # donanım alanlarını görür. Kullanıcının "Ölçülen / bilinen
+            # büyüklükler" grubuna girdiği FOV, IFOV, ekran ölçeği gibi
+            # değerler config'te yoktur; onları da katan tek kaynak
+            # `_panel_bilinenleri`'dir. Aksi hâlde kullanıcının GİRDİĞİ bir
+            # FOV, sonuç panelinde "türetildi" rozetiyle görünürdü.
+            given = self._panel_bilinenleri()
+            model = self.f_proj.currentData()
+            r = solver.solve(given, model=model)
+        except Exception:
+            return {}
+        out = {}
+        for node, v in r.values.items():
+            kind = r.kaynak_turu(node)
+            # İpucu metni çözücünün `describe`'ından gelir: hangi
+            # değerlerden, hangi bağıntıyla, ve gerekiyorsa tam zincir.
+            out[node] = (kind, r.describe(node))
+        return out
+
     def _show_results(self, res):
+        # Hızlı hesap ÖLÇÜLEN değerleri de kullanabilsin diye sakla.
+        # Panel yalnızca ham donanımı tutar (f, pitch, N); FOV/IFOV ölçümden
+        # gelir. Ölçümü katmazsak "ölçtüğüm FOV'dan f'i bul" yapılamaz —
+        # oysa kullanıcının asıl istediği ters yön tam olarak budur.
+        self._son_res = res
+        # Rozetler config'in HAM alanlarına bakabilsin diye sakla
+        # (ör. görüntü dairesi doğrudan mı verildi, yoksa türetildi mi).
+        try:
+            self._son_cfg = self._config_from_fields()
+        except Exception:
+            self._son_cfg = None
+        # Kaynak rozetleri: hangi sayı datasheet'ten, hangisi türetildi.
+        src = self._solver_sources()
+
+        def rozet(row, node):
+            kind_detail = src.get(node)
+            row.set_source(*kind_detail) if kind_detail else row.set_source(None)
+
         # ---- 1) FOV — sensörün gördüğü toplam açı ----
         if res.fov is not None:
             f = res.fov
             self.r_fov_xy.set_value(f"{f.fov_x_deg:.3f} × {f.fov_y_deg:.3f}")
             self.r_fov_d.set_value(f"{f.fov_diag_deg:.3f}")
             self.r_sensor.set_value(f"{f.sensor_w_mm:.2f} × {f.sensor_h_mm:.2f}")
+            rozet(self.r_fov_xy, "fov_x_deg")
+            rozet(self.r_fov_d, "fov_diag_deg")
+            rozet(self.r_sensor, "det_w_mm")
+
+            # --- Görüntü dairesi kısıtı ---
+            # Daire sensörü kapsamıyorsa yukarıdaki iki satır GEOMETRİK
+            # değerdir: "bu piksel eksenden şu kadar uzakta, demek ki şu
+            # açıyı görür". Lens oraya ışık düşürmüyorsa o açıdan görüntü
+            # GELMEZ. Ayrımı göstermezsek panel köşegen için 30.56° yazar
+            # ve kullanıcı bunu gerçek FOV sanar.
+            kapsiyor = getattr(f, "covers_sensor", True)
+            daire = getattr(f, "image_circle_mm", float("nan"))
+            daire_kisitli = (not kapsiyor) and math.isfinite(f.eff_fov_diag_deg)
+            # Cevap hangi satırsa o en üste gitsin.
+            self._fov_satir_sirala(daire_kisitli)
+            if daire_kisitli:
+                self.r_fov_eff.setVisible(True)
+                self.r_fov_circle.setVisible(True)
+                # Daire sensörün KENARINI da kesiyorsa (Hydra) FOV her yönde
+                # aynıdır — dairesel bir görüntüde yatay/dikey/köşegen ayrımı
+                # yoktur. Üç sayıyı ayrı yazmak olmayan bir ayrımı varmış
+                # gibi gösterir; tek sayıya indiriyoruz.
+                yonsuz = (abs(f.eff_fov_x_deg - f.eff_fov_diag_deg) < 1e-6
+                          and abs(f.eff_fov_y_deg - f.eff_fov_diag_deg) < 1e-6)
+                if yonsuz:
+                    self.r_fov_eff.set_value(
+                        f"{f.eff_fov_diag_deg:.3f}  (her yönde)", GOOD)
+                else:
+                    self.r_fov_eff.set_value(
+                        f"{f.eff_fov_x_deg:.3f} × {f.eff_fov_y_deg:.3f}"
+                        f"  ·  köş {f.eff_fov_diag_deg:.3f}", GOOD)
+                # Bu sayı kullanıcının girdiği "kullanılabilir FOV" ile
+                # aynıysa rozet DATASHEET olmalı. Hydra'da 21.5° üreticiden
+                # gelir; onu "türetildi" diye etiketlemek kullanıcıya kendi
+                # girdiğini hesaplanmış gibi gösterir.
+                _ufov = self.f_ufov.value()
+                _ufov_kaynak = (_ufov > 0 and
+                                abs(f.eff_fov_diag_deg - _ufov) < 0.05)
+                self.r_fov_eff.set_source(
+                    "given" if _ufov_kaynak else "derived",
+                    ("SİSTEMİN FOV'U BUDUR — üreticinin verdiği "
+                     f"kullanılabilir FOV ({_ufov:.3f}°) doğrudan budur; "
+                     "lensin görüntü dairesi sensörden küçük olduğu için "
+                     "sistemin FOV'unu bu değer belirler.\n\n"
+                     if _ufov_kaynak else
+                     "SİSTEMİN FOV'U BUDUR — lensin görüntü dairesiyle ") +
+                    ("" if _ufov_kaynak else
+                    "kırpıldıktan sonra sensörde gerçekten görüntü olan "
+                    "alan.\n\n") +
+                    f"Daire çapı {daire:.3f} mm, sensör köşegeni "
+                    f"{math.hypot(f.sensor_w_mm, f.sensor_h_mm):.3f} mm — "
+                    "köşeler dairenin DIŞINDA, orası karanlık.\n\n"
+                    + ("Daire sensörün kenarını da kestiği için FOV her "
+                       "yönde aynıdır; dairesel görüntüde yatay/dikey/"
+                       "köşegen ayrımı yoktur.\n\n" if yonsuz else "")
+                    + f"Aşağıdaki geometrik {f.fov_diag_deg:.3f}° köşegen, o "
+                    "köşe pikselinin GEOMETRİK olarak göreceği açıdır; lens "
+                    "oraya görüntü düşürmediği için gerçek değildir.")
+                self.r_fov_circle.set_value(f"{daire:.3f}", WARN)
+                # Daire çapı DOĞRUDAN girildiyse datasheet; yalnızca
+                # useful_FOV'dan hesaplandıysa türetilmiştir.
+                _daire_verildi = self.f_circle.value() > 0
+                self.r_fov_circle.set_source(
+                    "given" if _daire_verildi else "derived",
+                    "Lensin ürettiği dairesel görüntünün çapı.\n\n"
+                    + ("Datasheet'te doğrudan verildi.\n\n"
+                       if _daire_verildi else
+                       "Üreticinin kullanılabilir FOV değerinden türetildi:\n"
+                       "   çap = 2 · f · tan(useful_FOV / 2)\n\n")
+                    + "Sensör köşegeninden küçük olduğu için köşeler "
+                      "karanlıktır (vignetting).")
+                # Kullanılabilir alan — kısıtın bedeli.
+                self._fov_doluluk_yaz(f, daire)
+                # Geometrik satırların artık CEVAP olmadığı görünsün:
+                # sönük renk + etiketleri "geometrik" olarak işaretle.
+                self.r_fov_xy.set_value(
+                    f"{f.fov_x_deg:.3f} × {f.fov_y_deg:.3f}", MUTED)
+                self.r_fov_d.set_value(f"{f.fov_diag_deg:.3f}", MUTED)
+                self.r_fov_xy.set_label("Geometrik Y × D")
+                self.r_fov_d.set_label("Geometrik köşegen")
+                # Rozet açıklamalarını da ara-veri diline çevir; aksi hâlde
+                # bu satırlar hâlâ "FOV" gibi okunur.
+                _geo_not = (
+                    "ARA VERİ — sistemin FOV'u değil.\n\n"
+                    "Sensörün saf geometrisinden gelir: bu piksel eksenden "
+                    "şu kadar uzakta, demek ki şu açıyı görür. Lensin oraya "
+                    "ışık düşürüp düşürmediğini bilmez.\n\n"
+                    "Kullanıldığı yer: piksel koordinatı → açı dönüşümü. "
+                    "Rapor edilecek FOV için yukarıdaki 'Gerçekte görülen' "
+                    "satırını alın.")
+                self.r_fov_xy.set_source("derived", _geo_not)
+                self.r_fov_d.set_source("derived", _geo_not)
+            else:
+                # Gizlemek YETMEZ: satır eski koşunun değerini tutmaya devam
+                # eder ve bir sonraki sistemde yanlış sayı taşır. Gizlerken
+                # temizle.
+                self.r_fov_eff.clear()
+                self.r_fov_circle.clear()
+                self.r_fov_fill.clear()
+                self.r_fov_eff.setVisible(False)
+                self.r_fov_circle.setVisible(False)
+                self.r_fov_fill.setVisible(False)
+                self.r_fov_xy.set_label("Yatay × Dikey")
+                self.r_fov_d.set_label("Köşegen")
+
+            # Projeksiyon modeli — sonucun ayrılmaz parçası.
+            model = getattr(f, "projection", projmod.RECTILINEAR)
+            self.r_fov_model.set_value(
+                projmod.MODEL_LABELS.get(model, model).split(" —")[0])
+            yayilim = [v for _, v in projmod.compare_models(
+                self.f_focal.value(), f.sensor_w_mm) if math.isfinite(v)]
+            if len(yayilim) >= 2:
+                self.r_fov_model.set_source(
+                    "given",
+                    "Sol panelden seçilen lens projeksiyon modeli.\n\n"
+                    f"Aynı donanımda diğer modeller {min(yayilim):.3f}° – "
+                    f"{max(yayilim):.3f}° arası verirdi "
+                    f"(yayılım {max(yayilim)-min(yayilim):.3f}°).\n"
+                    "Yayılım küçükse 'FOV yanlış' şüphesinin sebebi model "
+                    "DEĞİLDİR.")
+
+            # Üretici FOV karşılaştırması — bağımsız doğrulama.
+            ufov = self.f_ufov.value()
+            if ufov > 0:
+                # Karşılaştırma GERÇEKTE GÖRÜLEN değerle yapılır. Görüntü
+                # dairesi üreticinin useful FOV'undan türetildiyse ikisi
+                # zaten birebir tutar — anlamlı olan, kırpma öncesi
+                # geometrik değerin ne kadar taştığıdır.
+                kars = (f.eff_fov_x_deg if math.isfinite(f.eff_fov_x_deg)
+                        else f.fov_x_deg)
+                fark = (kars - ufov) / ufov * 100.0
+                if fark >= 0:
+                    self.r_fov_check.set_value(
+                        f"{ufov:.2f}° → %{fark:+.2f}", GOOD)
+                    aciklama = ("Hesaplanan FOV üreticinin useful FOV'undan "
+                                "büyük — BEKLENEN yön.")
+                else:
+                    self.r_fov_check.set_value(
+                        f"{ufov:.2f}° → %{fark:+.2f}", WARN)
+                    aciklama = ("DİKKAT: hesaplanan FOV üreticinin verdiğinden "
+                                "DAR. Odak uzaklığı, piksel pitch'i ya da "
+                                "projeksiyon modeli gözden geçirilmeli.")
+                self.r_fov_check.set_source("derived", aciklama)
+            else:
+                self.r_fov_check.clear()
+
+            # --- ÖLÇÜMDEN gelen odak uzaklığı ve FOV ---
+            self._olculen_optigi_yaz(res)
 
             # ---- 2) IFOV — tek pikselin gördüğü açı ----
             # Piksel kare değilse iki eksen ayrı gösterilir.
@@ -1433,6 +2468,47 @@ class MainWindow(QMainWindow):
                 self.r_ifov.set_value(
                     f"{f.ifov_x_urad:.2f} × {f.ifov_y_urad:.2f}")
             self.r_ifov_as.set_value(f"{f.ifov_x_arcsec:.3f}")
+            rozet(self.r_ifov, "ifov_x_urad")
+            rozet(self.r_ifov_as, "ifov_x_arcsec")
+
+            # Açısal çözünürlük — aynı IFOV, datasheet'lerin kullandığı birimde.
+            self.r_ang_res.set_value(f"{math.degrees(f.ifov_x_urad * 1e-6):.5f}")
+            rozet(self.r_ang_res, "ifov_x_deg")
+
+            # Kenar pikseli. Merkezden farkı yüzde olarak da yazılır: fark
+            # büyükse tek bir IFOV sayısıyla tüm alanı temsil etmek yanıltıcıdır.
+            #
+            # HANGİ KENAR: daire sensörden küçükse sensörün fiziksel kenarı
+            # KARANLIKTIR; oradaki pikselin açısını "kenar IFOV'u" diye yazmak
+            # FOV panelindeki geometrik/gerçek hatasının aynısıdır. Aydınlık
+            # alanın gerçek kenarı dairenin sınırıdır, sayı oradan okunur.
+            kenar = (getattr(f, "ifov_eff_edge_x_urad", f.ifov_edge_x_urad)
+                     if daire_kisitli else f.ifov_edge_x_urad)
+            if math.isfinite(kenar) and f.ifov_x_urad > 0:
+                sapma = (kenar / f.ifov_x_urad - 1.0) * 100.0
+                self.r_ifov_edge.set_value(
+                    f"{kenar:.2f}  ({sapma:+.2f}%)",
+                    GOOD if abs(sapma) < 1.0 else WARN)
+                if daire_kisitli:
+                    self.r_ifov_edge.set_label("Görüntü kenarı")
+                    ek = ("\n\nBU SAYI DAİRENİN KENARINDAN okunur, sensörün "
+                          f"kenarından değil: aydınlık alan {f.eff_fov_x_deg / 2:.3f}° "
+                          "yarı-açıda biter.\n"
+                          f"Sensörün fiziksel kenarı ({f.fov_x_deg / 2:.3f}°) "
+                          f"{f.ifov_edge_x_urad:.2f} µrad verirdi ama orası "
+                          "karanlıktır.")
+                else:
+                    self.r_ifov_edge.set_label("Kenar pikseli")
+                    ek = ""
+                self.r_ifov_edge.set_source(
+                    "derived",
+                    "Kenar pikselinin gördüğü açı — merkez IFOV'undan "
+                    f"%{abs(sapma):.2f} farklı.\n\n"
+                    f"Projeksiyon modeli: {f.projection}.\n"
+                    "Rektilineerde piksel ölçeği alan boyunca sabit değildir; "
+                    "kenara doğru daralır." + ek)
+            else:
+                self.r_ifov_edge.clear()
 
         # ---- 3) Tilt ----
         # Dönme, tabloyla AYNI süzgeçten geçer (_fmt_rotation): eşleme
@@ -1465,8 +2541,32 @@ class MainWindow(QMainWindow):
 
         if res.match is not None:
             m = res.match
-            self.r_mirror.set_value("EVET" if m.mirrored else "hayır",
-                                    WARN if m.mirrored else GOOD)
+            # AYNA: "hayır" ile "ölçemedim" AYNI ŞEY DEĞİL.
+            # Eşleme çökünce varyant seçimi hiç yapılmaz, `mirrored` False
+            # kalır ve eskiden panel bunu güvenle "hayır" diye yazıyordu —
+            # gerçek bir koşuda ayna açıkça varken. Ölçülmemiş bir kararı
+            # ölçülmüş gibi göstermek, bu projenin tekrar eden hatası.
+            # NOT: F işaretlerinden gelen ayna kararı ŞİMDİLİK KULLANILMIYOR
+            # — döndürme testinde kararsız çıktı (aynı görüntünün döndürülmüş
+            # hâllerinde ayna cevabı değişiyordu). Bkz. pipeline.py.
+            if getattr(m, "mirror_known", False):
+                self.r_mirror.set_value("EVET" if m.mirrored else "hayır",
+                                        WARN if m.mirrored else GOOD)
+                self.r_mirror.set_source(
+                    "derived",
+                    "Ayna kararı, ham ve flip'li dedektör varyantları "
+                    "arasında RANSAC inlier sayısına göre yapılan seçimden "
+                    f"gelir ({m.num_inliers} inlier).")
+            else:
+                self.r_mirror.set_value("ölçülemedi", BAD)
+                self.r_mirror.set_source(
+                    "derived",
+                    "Ayna durumu ÖLÇÜLEMEDİ — 'ayna yok' demek değildir.\n\n"
+                    "Karar, ham ve flip'li varyantlar arasında hangisinin "
+                    "daha çok RANSAC inlier'ı verdiğine bakar. Eşleme "
+                    f"başarısız olduğu için ({m.num_inliers} inlier, en az "
+                    f"{image_analysis._MIN_INLIERS} gerekir) hiçbir varyant "
+                    "kazanmadı ve seçim yapılamadı.")
             self.r_inliers.set_value(f"{m.num_inliers}")
             if m.reproj_error_px == m.reproj_error_px:
                 rcol = GOOD if m.reproj_error_px < 2.0 else WARN
@@ -1521,19 +2621,58 @@ class MainWindow(QMainWindow):
         # GERÇEK yönelim gösterilir (0..360), ±90'a katlı değer değil.
         # Katlama 136°'yi 44°'ye düşürüyordu — kullanıcı tamamen farklı bir
         # yönelim okuyordu. Katlı değer parantez içinde referans olarak kalır.
+        # Desen kendini dönmede tekrar ediyorsa roll ancak o modül içinde
+        # bilinebilir. Bu bir ölçüm eksikliği değil, desenin bilgi
+        # içermemesidir — o yüzden ayrı bir uyarı satırı yerine DEĞERİN
+        # KENDİSİNDE gösterilir; okuyan kişi sayıyı yanlış okuyamaz.
+        #
+        # F İŞARETLERİ MODÜLÜ KALDIRIR. Köşedeki dört F asimetriktir
+        # (üreteç üçüncüsünü bilerek 45° eğik koyar), bu yüzden roll
+        # onlardan 0..360 arasında TEK değer olarak çözülür. O zaman
+        # "(mod 90°)" eki YANLIŞ olur — var olmayan bir belirsizliği
+        # bildirir. Ek yalnızca roll hâlâ homografiden geliyorsa yazılır.
+        _d = getattr(res, "dense", None)
+        _mod = getattr(_d, "rotation_modulus_deg", 360.0) if _d else 360.0
+        _f_ile = bool(getattr(p, "roll_from_markers", False))
+        _sfx = "" if _f_ile else (f"  (mod {_mod:.0f}°)" if _mod < 359.9 else "")
+        if _f_ile:
+            _sfx = f"  (F işaretlerinden, {p.n_markers} işaret)"
         if p.roll_full_deg == p.roll_full_deg:
-            self.r_roll.set_value(f"{p.roll_full_deg:.3f}")
+            self.r_roll.set_value(f"{p.roll_full_deg:.3f}{_sfx}")
         else:
-            self.r_roll.set_value(f"{-p.roll_deg:+.3f}")
+            self.r_roll.set_value(f"{-p.roll_deg:+.3f}{_sfx}")
         self.r_ptilt.set_value(f"{p.tilt_x_deg:+.3f} / {p.tilt_y_deg:+.3f}")
 
         # --- Kapsama ---
-        if p.coverage_frac == p.coverage_frac:
-            cf = 100.0 * p.coverage_frac
-            ccol = GOOD if p.pattern_fully_visible else WARN
-            self.r_cov_pattern.set_value(f"{cf:.1f}", ccol)
-        if p.sensor_fill_frac == p.sensor_fill_frac:
-            self.r_cov_sensor.set_value(f"{100.0 * p.sensor_fill_frac:.1f}")
+        # Kapsama ORAN değil MİKTAR olarak yazılır: "kullanılan / toplam px".
+        # Yüzde, bir bölgenin kaç piksel veri taşıdığını söylemiyordu; iki
+        # farklı çözünürlükte aynı "%61.7" tamamen farklı ölçüm gücü demek.
+        # Desen satırı GT'nin KENDİ pikselleriyle sayılır; dedektör uzayındaki
+        # alan homografinin büyütmesini taşır ve toplam, GT görüntüsünden
+        # büyük çıkardı (1280×1024 → 2.07 Mpx gibi).
+        ccol = GOOD if p.pattern_fully_visible else WARN
+        # Toplamın YANINDA kaynağın çözünürlüğü de yazılır — "1.310.720"
+        # tek başına hangi görüntüden geldiğini söylemiyor; "(1280×1024)"
+        # söylüyor ve satırın hangi uzayda sayıldığı tartışmasız oluyor.
+        if p.visible_area_gt_px == p.visible_area_gt_px:
+            # Bölgenin ne olduğu SAYIYLA BİRLİKTE yazılır. "492.497" tek
+            # başına hangi paydadan geldiğini söylemiyor; "cihaz FOV
+            # dairesi, r=403 px" söylüyor ve ekranın tamamıyla karıştırma
+            # ihtimali kalmıyor.
+            _b = p.ref_region or "—"
+            if p.ref_radius_gt_px == p.ref_radius_gt_px:
+                _b += f", r={p.ref_radius_gt_px:.0f} px"
+            self.r_cov_pattern.set_value(
+                f"{fmt_px(p.visible_area_gt_px)} / "
+                f"{fmt_px(p.pattern_area_gt_px)}  ({_b})", ccol)
+        if p.visible_area_px == p.visible_area_px:
+            _ill = p.illuminated_area_px
+            _dark = (_ill == _ill and _ill > 0
+                     and _ill < p.sensor_area_px - 1.0)
+            _tot = _ill if _dark else p.sensor_area_px
+            _et = "aydınlık alan" if _dark else fmt_shape(p.detector_shape)
+            self.r_cov_sensor.set_value(
+                f"{fmt_px(p.visible_area_px)} / {fmt_px(_tot)}  ({_et})")
         if p.max_angle_deg == p.max_angle_deg:
             self.r_cov_maxang.set_value(f"{p.max_angle_deg:.3f}")
         if p.edge_angles_deg:
@@ -1543,15 +2682,35 @@ class MainWindow(QMainWindow):
                 f"{e['üst']:.2f} / {e['alt']:.2f}")
         if p.margin_px == p.margin_px:
             mcol = GOOD if p.margin_px >= 0 else BAD
+            _sn = f"  sınır: {p.margin_limit}" if p.margin_limit else ""
             self.r_cov_margin.set_value(
-                f"{p.margin_px:+.0f}  ({p.margin_deg:+.2f}°)", mcol)
+                f"{p.margin_px:+.0f}  ({p.margin_deg:+.2f}°){_sn}", mcol)
         else:
             self.r_cov_margin.set_value("desen yarıçapı girilmedi", MUTED)
 
         # --- Açıklama satırı ---
         notes = []
-        if not p.pattern_fully_visible:
-            notes.append("Desen sensöre sığmıyor — kenarlardan kırpılıyor.")
+        # Kapsama ÖLÇÜLDÜ MÜ. Hizalama çökünce `measure_decenter_from_cross`
+        # yolu devreye giriyor: decenter doluyor ama kapsamaya hiç
+        # bakılmıyor. O durumda `pattern_fully_visible` varsayılan False
+        # kalır ve aşağıdaki not "desen sensöre sığmıyor" diye ÖLÇÜLMEMİŞ
+        # bir iddia yazardı — satırların kendisi "—" iken. Not artık ölçüm
+        # gerçekten yapıldıysa çıkar.
+        kapsama_olculdu = p.visible_area_px == p.visible_area_px
+        if kapsama_olculdu and not p.pattern_fully_visible:
+            if p.margin_limit == "görüntü dairesi":
+                notes.append(
+                    "Desen lensin görüntü dairesine sığmıyor — taşan kısım "
+                    "sensöre düşse bile KARANLIK. Daha büyük dedektör bunu "
+                    "çözmez; sınır lensin kendisi.")
+            else:
+                notes.append("Desen sensöre sığmıyor — kenarlardan kırpılıyor.")
+        if kapsama_olculdu and p.ref_region.startswith("tüm ekran"):
+            notes.append(
+                "Desen yarıçapı bilinmiyor — kapsama paydası zorunlu olarak "
+                "ekranın tamamı; cihazın hiç göremeyeceği kenar da sayıya "
+                "giriyor. Referans ekran açısal kaynak seçilirse yarıçap "
+                "otomatik türetilir.")
         e = p.edge_angles_deg or {}
         if e:
             yatay = (e.get("sol", 0) + e.get("sağ", 0)) / 2.0
@@ -1566,6 +2725,26 @@ class MainWindow(QMainWindow):
             notes.append(
                 "Ayna ekseni belirsiz — roll değeri bu belirsizlikten "
                 "etkilenebilir; decenter ve kapsama etkilenmez.")
+        # Dönme simetrisi: uyarı değil, ölçünün tanımı.
+        #
+        # AMA F işaretleri çözdüyse bu not artık DOĞRU DEĞİLDİR: desen
+        # halkalarıyla 90°'de kendini tekrarlasa da F'ler asimetriktir ve
+        # roll'ü tekleştirir. Notu yine de yazmak, kullanıcıya olmayan bir
+        # belirsizlik bildirmek olurdu.
+        if getattr(p, "roll_from_markers", False):
+            notes.append(
+                f"Roll {p.n_markers} F işaretinden tekleştirildi — halkalar "
+                f"90°'de kendini tekrarlasa da F'ler asimetrik olduğu için "
+                f"roll 0..360° arasında tektir "
+                f"(tutarsızlık ±{p.roll_marker_rms_deg:.2f}°, "
+                f"NCC {p.roll_marker_ncc:.2f}).")
+        elif d is not None and getattr(d, "symmetry_order", 1) > 1:
+            m = d.rotation_modulus_deg
+            notes.append(
+                f"Desen {m:.0f}° dönmelerde kendini tekrarlıyor; roll bu "
+                f"modül içinde geçerlidir (ör. {p.roll_full_deg:.1f}° ile "
+                f"{(p.roll_full_deg + m) % 360.0:.1f}° ayırt edilemez). "
+                f"Decenter, eğiklik ve kapsama etkilenmez.")
         self.lbl_point_note.setText("  ".join(notes))
 
     def _show_tilt(self, res):
@@ -1646,6 +2825,15 @@ class MainWindow(QMainWindow):
                                 "kendine benzer, dönme ölçülemez")
             elif state == "eşleşmedi":
                 warnings.append("görüntüler eşleştirilemedi")
+            elif getattr(m, "guided", False):
+                # Güdümlü eşlemede nokta sayısı TASARIM GEREĞİ azdır: GT
+                # yoğun hizalamanın homografisiyle ön-warp edilir ve yalnızca
+                # 20 px'lik kapıdan geçen eşleşmeler kullanılır. Onlarca
+                # nokta beklemek burada yanlış alarm üretir; ölçümün sağlığı
+                # yeniden-izdüşüm hatasından okunur.
+                if m.num_inliers < 6:
+                    warnings.append(f"güdümlü eşlemede çok az nokta "
+                                    f"({m.num_inliers})")
             elif m.num_inliers < 20:
                 warnings.append(f"az sayıda ortak nokta ({m.num_inliers})")
             if m.reproj_error_px == m.reproj_error_px and m.reproj_error_px > 2.0:
@@ -1657,7 +2845,11 @@ class MainWindow(QMainWindow):
                        res.star.det_ellipse.confidence)
             if conf < 0.7:
                 problems.append(f"desen net seçilemedi (güven {conf:.2f})")
-        else:
+        elif not (res.tilt is not None and res.tilt.ok):
+            # "Dairesel desen bulunamadı" yalnızca HİÇBİR yöntem tilt
+            # ölçemediyse bir uyarıdır. Siemens star bulunamasa da halka-fit
+            # (tilt_estimators) ölçüyorsa ortada eksik bir şey yok; eski hâli
+            # ölçüm başarılıyken de uyarı yazıyordu.
             warnings.append("dairesel desen bulunamadı")
 
         if problems:
@@ -1686,10 +2878,16 @@ class MainWindow(QMainWindow):
         msgs = [m for m in res.messages
                 if "gürültüsünün altında" not in m
                 and not m.lstrip().startswith("·")]
-        if msgs:
-            self.msg_label.setText("⚠ " + "\n⚠ ".join(msgs))
-        else:
-            self.msg_label.setText("")
+        # "Bilgi:" ile başlayanlar uyarı değil, yöntem notudur (polarite
+        # terslendi, güdümlü eşleme kullanıldı, tilt şu yöntemle ölçüldü).
+        # Ölçüm başarılıyken de yazıldıkları için uyarı alanında durmaları
+        # sağlam sonucu sorunluymuş gibi okutuyordu; Ayrıntılar'a taşındılar.
+        infos = [m[len("Bilgi:"):].strip() for m in msgs
+                 if m.startswith("Bilgi:")]
+        warns = [m for m in msgs if not m.startswith("Bilgi:")]
+        self.msg_label.setText("⚠ " + "\n⚠ ".join(warns) if warns else "")
+        self.lbl_details_notes.setText("· " + "\n· ".join(infos) if infos else "")
+        self.lbl_details_notes.setVisible(bool(infos))
         self.status_label.setText("Analiz tamamlandı.")
 
 

@@ -19,8 +19,13 @@ import cv2
 import numpy as np
 
 from .config import SystemConfig
+
+
+class _FMarkerUyusmazlik(Exception):
+    """F işaretlerinin rolü homografininkiyle çelişti — sonuç kullanılmaz."""
+from . import f_markers
 from . import (optics, image_analysis, siemens_star, tilt_estimators,
-               dense_align, pointing)
+               dense_align, pointing, cross_locate, f_markers)
 
 
 @dataclass
@@ -43,8 +48,18 @@ class AnalysisResult:
     dense: dense_align.DenseResult | None = None
 
     # Yönelim hataları (decenter / roll / tilt) + FOV kapsaması.
-    # Yoğun hizalamanın homografisinden türetilir; ayrı ölçüm yapmaz.
+    # Normalde yoğun hizalamanın homografisinden türetilir. Hizalama
+    # çökerse decenter yine de dolar — merkez cross'undan doğrudan
+    # ölçülür (bkz. `cross`); o durumda roll/tilt/kapsama boş kalır.
     pointing: pointing.PointingResult | None = None
+
+    # Merkez cross'unun tespiti. Yalnızca hizalama çöktüğünde denenir;
+    # decenter'ı homografiden bağımsız ölçmek için.
+    cross: cross_locate.CrossResult | None = None
+
+    # Köşe F işaretleri. Roll'ün mod-90 belirsizliğini ve ayna kararını
+    # çözer; hizalamaya ve SIFT'e bağlı değildir.
+    f_markers: f_markers.FMatch | None = None
 
     # Önizleme görüntüleri (BGR, GUI için hazır)
     gt_preview: np.ndarray | None = None
@@ -220,26 +235,60 @@ def run_analysis(gt_path: str, det_path: str, cfg: SystemConfig,
         res.messages.append(str(e))
         return res
 
+    # --- 3B. Yoğun (desen-agnostik) hizalama ---
+    # SIFT'ten ÖNCE koşar. Sebebi: kendine-benzer desenlerde kör SIFT
+    # dejenere sonuç üretiyor (ayrıntı: image_analysis._guided_match).
+    # Yoğun yolun homografisi SIFT'e ön-bilgi olarak verilince SIFT'in
+    # büyük dönme/ölçeği kendi başına bulması gerekmiyor. Yoğun yol yine
+    # bağımsız bir ölçümdür; SIFT'in yerine geçmez.
+    if dense:
+        report(25, "Yoğun hizalama (piksel piksel)…")
+        try:
+            # Polarite uyumu: beyaz zeminli GT ile koyu zeminli çekim
+            # yoğun hizalamada da eşleşmez (ECC yoğunluk korelasyonudur).
+            # Tersleme geometriyi değiştirmez.
+            gt_dense, inv = image_analysis.match_polarity(gt_gray, det_gray)
+            if inv:
+                res.messages.append(
+                    "Bilgi: ground truth ile dedektörün kontrast polaritesi "
+                    "ters — eşleme için ground truth terslendi; geometri ve "
+                    "ölçüm etkilenmez.")
+            res.dense = dense_align.analyze_dense(gt_dense, det_gray)
+            res.messages.extend(res.dense.messages)
+        except Exception as e:                              # noqa: BLE001
+            res.messages.append(f"Yoğun hizalama hatası: {e}")
+
     # --- 4. Feature eşleme + homografi ---
-    report(30, "Görüntüler eşleniyor (SIFT)…")
+    report(45, "Görüntüler eşleniyor (SIFT)…")
     try:
+        prior_H = res.dense.homography if res.dense is not None else None
+        prior_variant = (res.dense.coarse.variant
+                         if res.dense is not None and res.dense.coarse is not None
+                         else None)
         res.match = image_analysis.analyze(gt_path, det_path, cfg,
-                                           use_sift=use_sift)
+                                           use_sift=use_sift,
+                                           prior_H=prior_H,
+                                           prior_variant=prior_variant)
         if res.match.homography is None:
             res.messages.append(
                 "Görüntüler eşleştirilemedi — dönme/ayna bilgisi homografiden "
                 "alınamadı. Tilt yine de yıldız elipsinden ölçülecek.")
+        elif res.match.guided:
+            res.messages.append(
+                f"Bilgi: eşleme, yoğun hizalamanın homografisiyle güdümlü "
+                f"yapıldı — kör SIFT bu desende çözemiyor "
+                f"({res.match.guided_matches} eşleşme, "
+                f"{res.match.num_inliers} inlier, "
+                f"{res.match.reproj_error_px:.2f} px).")
     except Exception as e:                              # noqa: BLE001
         res.messages.append(f"Eşleme hatası: {e}")
 
     # --- 5. Siemens star elips tilt ---
     report(65, "Merkezi yıldız elipsi ölçülüyor…")
+    star_missing = False
     try:
         res.star = siemens_star.analyze_pair(gt_gray, det_gray)
-        if not res.star.ok:
-            res.messages.append(
-                "Merkezi Siemens star tespit edilemedi — görüntülerde merkezi "
-                "radyal desen net görünmüyor olabilir.")
+        star_missing = not res.star.ok
     except Exception as e:                              # noqa: BLE001
         res.messages.append(f"Elips tespit hatası: {e}")
 
@@ -255,16 +304,19 @@ def run_analysis(gt_path: str, det_path: str, cfg: SystemConfig,
     except Exception as e:                                  # noqa: BLE001
         res.messages.append(f"Tilt ölçüm katmanı hatası: {e}")
 
-    # --- 5c. Yoğun (desen-agnostik) hizalama + piksel piksel kalıntı ---
-    # Ayrı bir yol olarak koşar: SIFT'in kendine-benzer desenlerde ürettiği
-    # sahte sonuçlara karşı bağımsız bir ölçüm ve distorsiyon haritası verir.
-    if dense:
-        report(88, "Yoğun hizalama (piksel piksel)…")
-        try:
-            res.dense = dense_align.analyze_dense(gt_gray, det_gray)
-            res.messages.extend(res.dense.messages)
-        except Exception as e:                              # noqa: BLE001
-            res.messages.append(f"Yoğun hizalama hatası: {e}")
+    # "Siemens star bulunamadı" ancak HİÇBİR yöntem tilt ölçemediyse bir
+    # eksikliktir. Eş merkezli çember paterninde yıldız zaten yoktur ve tilt
+    # halka-fit ile ölçülür; o durumda bu satır ölçüm başarılıyken de uyarı
+    # yazıyordu. Karar bu yüzden tilt katmanından SONRA verilir.
+    if star_missing:
+        if res.tilt is not None and res.tilt.ok:
+            res.messages.append(
+                f"Bilgi: merkezi Siemens star yok — tilt "
+                f"'{res.tilt.primary_method}' yöntemiyle ölçüldü.")
+        else:
+            res.messages.append(
+                "Merkezi Siemens star tespit edilemedi — görüntülerde merkezi "
+                "radyal desen net görünmüyor olabilir.")
 
     # --- 5d. Yönelim hataları (decenter / roll / tilt) + kapsama ---
     # Yoğun hizalamanın homografisinden türetilir. SIFT homografisi de
@@ -281,8 +333,107 @@ def run_analysis(gt_path: str, det_path: str, cfg: SystemConfig,
                 pattern_center_px=pattern_center_px,
                 pattern_radius_px=pattern_radius_px)
             res.messages.extend(res.pointing.messages)
+
+            # --- Roll ve ayna: F işaretlerinden (BAĞLI) ---
+            #
+            # Homografiden gelen roll, desenin dönme simetrisi kadar
+            # belirsizdir: eş merkezli halka deseni 90°'de kendini
+            # tekrarladığı için panel "136.356 (mod 90°)" yazıyordu.
+            # Köşedeki dört F asimetriktir ve üreteç üçüncüsünü bilerek
+            # 45° eğik koyar ("hiçbir dönme/aynalama kombinasyonu paterni
+            # kendine götürmez") — roll'ü tekleştiren bilgi oradadır.
+            #
+            # BU YOL BİR SÜRE DEVRE DIŞIYDI: F'ler bulunuyor ama hangi
+            # F'nin hangisine karşılık geldiği yanlış çözülüyordu; 8
+            # dönmeden 4'ü yanlış çıkıyor ve ayna kararı dönmeyle
+            # değişiyordu. Üç kök neden düzeltildi (doluluk elemesi
+            # simetriyi kıran F'yi atıyordu; tek şablon F'leri kimliğiyle
+            # ayırt edemiyordu; _fit_angle'ın açısı görüntü dönmesinin
+            # TERSİ olduğu için işaret hatalıydı).
+            #
+            # Bağlanma şartı buydu ve artık sağlanıyor: test_f_markers.py
+            # [8] döndürme testi 8/8 geçiyor (hatalar 0.0-0.4°, ayna sekiz
+            # dönmede de sabit). Gerçek çiftte roll 223.30°, NCC 0.98,
+            # tutarsızlık 0.74°.
+            #
+            # HOMOGRAFİ YİNE DE KORUNUR: F'ler roll'ü yalnızca TEKLEŞTİRİR.
+            # Aşağıda mod-90 tutarlılığı kontrol edilir; iki yol
+            # çelişirse F'nin sonucu kabul edilmez, çünkü homografi tüm
+            # desenden, F'ler dört küçük bölgeden gelir.
+            try:
+                fm_res = f_markers.solve_roll_and_mirror(
+                    gt_gray, det_v,
+                    gt_center=pattern_center_px)
+                res.messages.extend(fm_res.messages)
+                if fm_res.ok:
+                    p = res.pointing
+                    homo = p.roll_full_deg
+                    if homo == homo:
+                        # Desenin simetri modülü içinde aynı yeri
+                        # göstermeliler. Göstermiyorlarsa biri yanılıyor.
+                        m = float(res.dense.rotation_modulus_deg)
+                        if not (m > 0.0) or m > 180.0:
+                            # Simetri yoksa modül 360 döner; o durumda
+                            # karşılaştırma zaten tam açı üzerindendir.
+                            m = 360.0
+                        fark = abs(((fm_res.roll_deg - homo) % m))
+                        fark = min(fark, m - fark)
+                        if fark > 8.0:
+                            res.messages.append(
+                                f"Uyarı: F işaretlerinin rolü "
+                                f"({fm_res.roll_deg:.2f}°) homografininkiyle "
+                                f"({homo:.2f}°) {m:.0f}° modülünde "
+                                f"{fark:.2f}° ayrışıyor — F sonucu "
+                                "kullanılmadı.")
+                            raise _FMarkerUyusmazlik
+                    p.roll_full_deg = fm_res.roll_deg
+                    p.roll_from_markers = True
+                    p.roll_marker_rms_deg = fm_res.rms_px
+                    p.roll_marker_ncc = fm_res.ncc
+                    p.n_markers = fm_res.n_matched
+                    if fm_res.mirror_known:
+                        p.mirror_from_markers = True
+                        p.mirrored_markers = fm_res.mirrored
+                    res.messages.append(
+                        f"Bilgi: roll {fm_res.n_matched} F işaretinden "
+                        f"tekleştirildi ({fm_res.roll_deg:.3f}°); "
+                        "mod-90 belirsizliği kalktı.")
+            except _FMarkerUyusmazlik:
+                pass
+            except Exception as e:                          # noqa: BLE001
+                res.messages.append(f"F işareti ölçümü yapılamadı: {e}")
         except Exception as e:                              # noqa: BLE001
             res.messages.append(f"Yönelim ölçüm hatası: {e}")
+    else:
+        # Hizalama çöktü. ESKİDEN BURADA HİÇBİR ŞEY YAPILMIYORDU ve
+        # decenter dahil bütün yönelim satırları "ölçülemedi" oluyordu.
+        #
+        # Oysa decenter merkez kaçıklığıdır ve desen tam bunun için
+        # ortasında bir cross taşır; tüm deseni hizalamak gerekmez. Eş
+        # merkezli halka deseni dairesel simetrik olduğu için faz
+        # korelasyonu kırılgandır (gerçek bir ölçümde NCC 0.09), ama aynı
+        # görüntüde cross şablonla NCC 0.96 bulunuyor.
+        #
+        # Bu yol YALNIZCA decenter'ı doldurur. Roll/tilt cross'tan çıkmaz
+        # (4 kat simetrik + keystone merkezde sıfır), kapsama da desenin
+        # sensöre düşen alanını ister; onlar eksik kalır.
+        report(90, "Merkez cross'undan decenter ölçülüyor…")
+        try:
+            olcek_ipucu = (res.dense.coarse.scale
+                           if (res.dense is not None
+                               and res.dense.coarse is not None) else None)
+            cr = cross_locate.locate_cross(det_gray, gt_gray,
+                                           scale_hint=olcek_ipucu,
+                                           gt_center_px=pattern_center_px)
+            res.cross = cr
+            res.messages.extend(cr.messages)
+            if cr.ok:
+                cx, cy = cross_locate.refine_subpixel(det_gray, cr.x_px, cr.y_px)
+                res.pointing = pointing.measure_decenter_from_cross(
+                    cx, cy, det_gray.shape, cfg)
+                res.messages.extend(res.pointing.messages)
+        except Exception as e:                              # noqa: BLE001
+            res.messages.append(f"Cross tabanlı decenter hatası: {e}")
 
     # --- 6. Önizlemeler ---
     report(92, "Önizlemeler hazırlanıyor…")

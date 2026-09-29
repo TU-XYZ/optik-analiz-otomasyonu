@@ -9,7 +9,7 @@ from PyQt5.QtCore import Qt, QPoint, QRect, pyqtSignal
 from PyQt5.QtGui import QImage, QPixmap, QPainter, QFont, QPen, QColor
 from PyQt5.QtWidgets import (
     QLabel, QWidget, QVBoxLayout, QHBoxLayout, QFrame, QSizePolicy,
-    QScrollArea,
+    QScrollArea, QDoubleSpinBox,
 )
 
 
@@ -232,8 +232,57 @@ class ImageView(QLabel):
 
 # ----------------------------- Sonuç satırı --------------------------------
 
+# Kaynak rozeti renkleri. Bir sayının NEREDEN geldiği, sayının kendisi kadar
+# önemlidir: datasheet'ten okunan bir değerle başka değerlerden türetilen bir
+# değer aynı güvene sahip değildir ve kullanıcı ikisini ayırt edebilmelidir.
+class BlankableDoubleSpin(QDoubleSpinBox):
+    """
+    Boş bırakılabilen sayı alanı — boş = BİLİNMİYOR.
+
+    NEDEN VAR
+    ---------
+    Normal `QDoubleSpinBox` boş bırakılamaz: alanı silseniz bile minimuma
+    döner. Ama bu projede boşluk BİLGİ taşıyor — "odak uzaklığını bilmiyorum,
+    sen hesapla" demenin tek yolu o alanı boş bırakmaktır.
+
+    Alt sınır 0'dır ve 0 "verilmedi" anlamına gelir (config.py'deki
+    konvansiyonun aynısı). 0 iken kutuda sayı değil `placeholder` görünür,
+    böylece "0 mm'lik bir lens" ile "bilinmeyen lens" karışmaz.
+    """
+
+    def __init__(self, hi: float, dec: int, suffix: str,
+                 placeholder: str = "bilinmiyor", parent=None):
+        super().__init__(parent)
+        self._suffix = suffix
+        self._ph = placeholder
+        self.setRange(0.0, hi)
+        self.setDecimals(dec)
+        self.setButtonSymbols(QDoubleSpinBox.NoButtons)
+        self.setSpecialValueText(placeholder)   # 0 iken bunu göster
+        self.setSuffix(suffix)
+
+    # 0 (= special value) iken Qt suffix'i de gizler; bu doğru davranış.
+    def bos_mu(self) -> bool:
+        return self.value() <= 0.0
+
+    def temizle(self):
+        self.setValue(0.0)
+
+
+SRC_GIVEN = "#7c8798"      # datasheet / kullanıcı girdisi — nötr
+SRC_DERIVED = "#c9a0ff"    # türetildi — dikkat çeksin ama alarm olmasın
+SRC_MEASURED = "#5fd0c8"   # ölçüldü — görüntüden gelen, en değerli kaynak
+
+
 class ResultRow(QWidget):
-    """Etiket + değer gösteren tek satırlık sonuç bileşeni."""
+    """
+    Etiket + değer gösteren tek satırlık sonuç bileşeni.
+
+    Değerin yanında isteğe bağlı bir **kaynak rozeti** taşır: sayının
+    datasheet'ten mi okunduğu yoksa başka değerlerden mi türetildiği.
+    Türetilmiş bir değerde rozetin üstüne gelince türetim zinciri görünür
+    ("IFOV ve piksel pitch'inden türetildi" gibi).
+    """
 
     def __init__(self, label: str, unit: str = "", tooltip: str = ""):
         super().__init__()
@@ -241,10 +290,22 @@ class ResultRow(QWidget):
         lay.setContentsMargins(2, 3, 2, 3)
 
         self._label = QLabel(label)
+        # Kısaltma için tam metni sakla — `_etiketi_sigdir` bunu kullanır.
+        self._label_tam = label
+        # Kurucudan gelen açıklayıcı ipucu var mı? Varsa kısaltma onu ezmez.
+        self._aciklama_ipucu = bool(tooltip)
         self._label.setStyleSheet(f"color:{MUTED};")
         if tooltip:
             self._label.setToolTip(tooltip)
             self.setToolTip(tooltip)
+
+        # Kaynak rozeti — varsayılan olarak gizli, `set_source` ile açılır.
+        self._badge = QLabel("")
+        self._badge.setVisible(False)
+        self._badge_on = False
+        bf = QFont()
+        bf.setPointSize(9)
+        self._badge.setFont(bf)
 
         self._value = QLabel("—")
         f = QFont("monospace")
@@ -259,13 +320,121 @@ class ResultRow(QWidget):
         self._unit.setStyleSheet(f"color:{MUTED};")
         self._unit.setMinimumWidth(58)
 
-        lay.addWidget(self._label, 1)
-        lay.addWidget(self._value, 0)
+        # Yerleşim: etiket esner, SAYI ESNEMEZ ama kırpılmasına da izin
+        # verilmez. Eskiden etiket tek başına stretch alıyordu; dar panelde
+        # sayının yerini yiyip "0 × 9.200" ya da yalnızca "(-0.64%)" gibi
+        # yarım değerler görünüyordu — sonuç panelinde en kritik hata bu,
+        # çünkü yanlış okunan sayı sessizce yanlış karara götürür.
+        # Yerleşim kuralı: ETİKET DE DEĞER DE KIRPILMAZ.
+        #
+        # Bu satır iki kez yanlış kuruldu ve ikisi de sonuç panelinde en
+        # tehlikeli hatayı üretti — yarım okunan bir sayı sessizce yanlış
+        # karara götürür:
+        #   1. Etiket tek başına stretch alınca değer kırpıldı
+        #      ("0 × 9.200", yalnızca "(-0.64%)").
+        #   2. Etikete `Ignored` verilince bu kez etiket yok oldu
+        #      ("Desende…"), değer yine soldan kesildi.
+        #
+        # Çözüm ikisini de sıkıştırmaya çalışmamak: değer uzunsa satır
+        # SARILIR ve iki satıra yayılır. Panel dar da olsa hiçbir şey
+        # kaybolmaz.
+        self._label.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._label.setMinimumWidth(92)
+        self._value.setWordWrap(True)
+        self._value.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        self._value.setMinimumWidth(104)
+        lay.addWidget(self._label, 2)
+        lay.addWidget(self._badge, 0)
+        lay.addWidget(self._value, 3)
         lay.addWidget(self._unit, 0)
+
+    def set_label(self, text: str):
+        """Satır etiketini değiştirir (kısaltma mantığını bozmadan)."""
+        self._label_tam = text
+        self._etiketi_sigdir()
+
+    def _etiketi_sigdir(self):
+        """
+        Etiketi kutuya sığdırır; taşarsa sonunu "…" ile keser ve tam
+        metni ipucuna koyar. Kesilen etiket okunabilir kalmalı — yoksa
+        kullanıcı hangi satıra baktığını bilemez.
+        """
+        tam = getattr(self, "_label_tam", None)
+        if tam is None:
+            return
+        fm = self._label.fontMetrics()
+        w = max(self._label.width(), self._label.minimumWidth())
+        self._label.setText(fm.elidedText(tam, Qt.ElideRight, w))
+        if self._label.text() != tam:
+            # Etiket kısaldıysa tam metin ipucunda görünmeli — kullanıcı
+            # hangi satıra baktığını anlayabilsin. Satırın kendi açıklayıcı
+            # ipucu varsa (kurucuya verilen `tooltip`) o korunur; yalnızca
+            # kısaltmadan doğan boşluk doldurulur.
+            if not self._aciklama_ipucu:
+                self._label.setToolTip(tam)
+        elif not self._aciklama_ipucu:
+            self._label.setToolTip("")
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._etiketi_sigdir()
 
     def set_value(self, text: str, color: str = ACCENT):
         self._value.setText(text)
         self._value.setStyleSheet(f"color:{color};")
+
+    def set_source(self, kind: str | None, detail: str = ""):
+        """
+        Değerin kaynağını rozet olarak gösterir.
+
+        `kind`:
+          * ``"given"``   — datasheet ya da kullanıcı girdisi
+          * ``"measured"`` — görüntüden ölçüldü (hesap değil)
+          * ``"unit"``    — aynı değerin başka birimde yazılışı
+          * ``"derived"`` — gerçek bir bağıntıyla hesaplandı
+          * ``None``      — rozet gizlenir (kaynak bilinmiyor/anlamsız)
+
+        `detail` rozetin ipucu metnidir; türetilmiş değerlerde türetim
+        zinciri buraya yazılır. Rozet metnini KISA tutmak şart — satırın
+        asıl işi sayıyı göstermek, rozet yalnızca ona bir güven etiketi
+        iliştirmek.
+        """
+        if kind is None:
+            self._badge.setVisible(False)
+            self._badge_on = False
+            self._badge.setToolTip("")
+            return
+        if kind == "given":
+            metin, renk = "datasheet", SRC_GIVEN
+        elif kind == "measured":
+            # GÖRÜNTÜDEN gelen değer. "türetildi" demek onu bir hesap gibi
+            # gösterirdi; oysa hesap değil ÖLÇÜMDÜR ve sistemin gerçek
+            # davranışını anlatır — datasheet'in söylediğini değil.
+            metin, renk = "ölçüldü", SRC_MEASURED
+        elif kind == "unit":
+            # Birim çevrimi yeni bilgi değil — aynı sayının başka yazılışı.
+            # "türetildi" demek hesap yapılmış izlenimi verirdi.
+            metin, renk = "birim", SRC_GIVEN
+        else:
+            metin, renk = "türetildi", SRC_DERIVED
+        self._badge.setText(metin)
+        self._badge.setStyleSheet(
+            f"color:{renk}; border:1px solid {renk}; border-radius:6px; "
+            f"padding:0px 5px; font-size:9px;")
+        self._badge.setToolTip(detail or metin)
+        self._badge.setVisible(True)
+        self._badge_on = True
+
+    def source(self) -> str:
+        """
+        Rozet metni; rozet kapalıysa boş.
+
+        `isVisible()` KULLANILMAZ: Qt'de gizli bir pencerenin çocukları da
+        görünmez sayılır, dolayısıyla henüz `show()` edilmemiş bir panelde
+        (testlerin koştuğu hâl) her rozet boş görünürdü. Rozetin AÇIK olup
+        olmadığı ayrı bir bayrakta tutulur.
+        """
+        return self._badge.text() if self._badge_on else ""
 
     def value(self) -> str:
         """
@@ -279,6 +448,7 @@ class ResultRow(QWidget):
 
     def clear(self):
         self.set_value("—", MUTED)
+        self.set_source(None)
 
 
 def hline() -> QFrame:

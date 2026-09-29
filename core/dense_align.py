@@ -220,6 +220,47 @@ def _similarity_matrix(scale: float, rot_deg: float,
     return T2 @ R @ T1
 
 
+def rotational_symmetry_order(img: np.ndarray,
+                              center: tuple | None = None) -> int:
+    """
+    Desenin kendi dönme simetrisi katı: 4 (90°), 2 (180°) ya da 1 (yok).
+
+    Görüntü merkez etrafında döndürülüp kendisiyle karşılaştırılır. Yüksek
+    korelasyon "bu desen o açı kadar döndürülünce kendine benziyor" demektir
+    — o zaman ölçülen dönme ancak 360/kat modülünde anlamlıdır.
+
+    Yalnızca merkeze sığan DAİRE içi karşılaştırılır; köşeler dönmede
+    görüntüden çıkar ve karşılaştırmayı bozar.
+    """
+    if img is None or img.ndim != 2:
+        return 1
+    h, w = img.shape[:2]
+    c = center if center is not None else ((w - 1) / 2.0, (h - 1) / 2.0)
+    r = min(c[0], c[1], w - 1 - c[0], h - 1 - c[1])
+    if r < 20:
+        return 1
+    yy, xx = np.mgrid[0:h, 0:w]
+    mask = ((xx - c[0]) ** 2 + (yy - c[1]) ** 2) < r * r
+    base = img[mask].astype(np.float64)
+    base -= base.mean()
+    nb = np.linalg.norm(base)
+    if nb < 1e-9:
+        return 1
+
+    def self_ncc(angle: float) -> float:
+        M = cv2.getRotationMatrix2D((float(c[0]), float(c[1])), angle, 1.0)
+        rot = cv2.warpAffine(img, M, (w, h))[mask].astype(np.float64)
+        rot -= rot.mean()
+        nr = np.linalg.norm(rot)
+        return float(base @ rot / (nb * nr)) if nr > 1e-9 else 0.0
+
+    if self_ncc(90.0) >= SYMMETRY_NCC_MIN and self_ncc(270.0) >= SYMMETRY_NCC_MIN:
+        return 4
+    if self_ncc(180.0) >= SYMMETRY_NCC_MIN:
+        return 2
+    return 1
+
+
 def _score_alignment(gt: np.ndarray, det: np.ndarray, M: np.ndarray) -> float:
     """
     Bir dönüşümün ne kadar iyi olduğunu ölçer: warp edilmiş GT ile dedektörün
@@ -420,9 +461,13 @@ def coarse_align(gt: np.ndarray, det: np.ndarray,
     res.rot_candidates = rot_cands
     res.rot_ambiguous = bool(rot_amb)
     if rot_amb:
+        # Bu bir arıza değil, YÖNTEM SEÇİMİDİR: kestirme yol (faz
+        # korelasyonu) bu desende çalışmadığı için pahalı ama sağlam yol
+        # (tam açı taraması + ECC) koşuldu. Sonuç doğru, yalnızca daha
+        # uzun sürüyor — o yüzden uyarı değil bilgi olarak raporlanır.
         res.messages.append(
-            "Dönme faz korelasyonuyla çözülemedi (dairesel simetrik desen) — "
-            "açı taraması yapıldı, nihai seçim ECC ile.")
+            "Bilgi: dönme faz korelasyonuyla okunamadı (dairesel simetrik "
+            "desen) — tam açı taraması yapıldı, nihai seçim ECC ile.")
     if not res.ok:
         res.messages.append(
             f"Kaba hizalama güveni düşük (korelasyon {score:.3f}) — "
@@ -553,6 +598,13 @@ WINSIZE = 25
 # Gerçek bir ayrımda fark 0.1 mertebesindedir (ölçüldü: 0.759 vs 0.868);
 # dejenere durumda tam 0.0000 çıkar.
 MIRROR_MARGIN_MIN = 0.01
+
+# Desenin KENDİ dönme simetrisi bu eşiğin üstündeyse "kendini tekrar ediyor"
+# sayılır. Ölçülen: FOV deseni 90/180/270°'de kendisiyle 0.965 korelasyon
+# veriyor (aynalanmış hâliyle 0.896 — yani ayna AYIRT EDİLEBİLİR, dönme
+# değil). Böyle bir desende roll ancak 360/kat kadar bir modül içinde
+# bilinebilir; bu bir ölçüm hatası değil, desenin bilgi içermemesidir.
+SYMMETRY_NCC_MIN = 0.90
 
 # Log-polar faz korelasyonunun güveni bunun altındaysa dönme okunamamış
 # sayılır ve açı taraması devreye girer. Dairesel simetrik desenlerde
@@ -851,6 +903,152 @@ def _fit_radial_model(res: ResidualResult, rmax: float,
 
 
 # --------------------------------------------------------------------------
+# 2B. Kademe — ÖLÇÜME GİREN BÖLGE (hizalamayı GT'nin tamamıyla yapma)
+# --------------------------------------------------------------------------
+#
+# ECC'nin şablonu ground truth'un TAMAMIDIR ve şablonun her pikseli
+# korelasyon katsayısına tam ağırlıkla girer. Oysa GT'nin büyük bir kısmı
+# ölçüme hiç katılmaz:
+#
+#   * dedektöre DÜŞMEYEN kısım — kadraj dışında kalır, karşılığı yoktur;
+#   * DESEN İÇERMEYEN kısım — referans ekranın boş kenarı, sabit bir zemin.
+#
+# Ölçülen bir çiftte (STOS deseni, CMV4000): GT 1280×1024, deseni taşıyan
+# daire r=404 (çerçevenin %39'u), dedektöre düşen bölge çerçevenin %81'i.
+# Yani şablonun %61'i sabit siyah. Sabit bölge korelasyonun payına hiç
+# katkı vermez ama paydasında durur; hedef fonksiyonu düzleştirir.
+#
+# Bu kademe, hizalamayı bu iki kısıtın KESİŞİMİNDE tekrar çözer. Bölge
+# ölçülmüş homografiden çıkar (dedektöre düşen kısım ancak H bilinince
+# belli olur), o yüzden ikinci geçiştir — birinci geçiş bölgeyi bulmak
+# için, ikincisi orada çözmek için.
+
+
+def content_bbox(img: np.ndarray, pad: int = WINSIZE) -> tuple | None:
+    """
+    Desenin kapladığı kutu (x, y, w, h) — zeminden sapan pikseller.
+
+    Eşik ZEMİNDEN SAPMA üzerinden kurulur, parlaklık üzerinden değil:
+    desen siyah zeminde beyaz da olabilir (v6_inverted), beyaz zeminde
+    siyah da. Medyan zemin kabul edilir, ondan belirgin sapan her piksel
+    içerik sayılır.
+    """
+    a = img.astype(np.float32)
+    bg = float(np.median(a))
+    lo, hi = np.percentile(a, (1.0, 99.0))
+    thr = max(8.0, 0.15 * float(hi - lo))
+    ink = np.abs(a - bg) > thr
+    if not ink.any():
+        return None
+    ys, xs = np.nonzero(ink)
+    x0, x1 = int(xs.min()) - pad, int(xs.max()) + 1 + pad
+    y0, y1 = int(ys.min()) - pad, int(ys.max()) + 1 + pad
+    h, w = img.shape[:2]
+    x0, y0 = max(0, x0), max(0, y0)
+    x1, y1 = min(w, x1), min(h, y1)
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def visible_bbox(gt_shape: tuple, det_shape: tuple,
+                 H: np.ndarray, pad: int = WINSIZE) -> tuple | None:
+    """
+    Dedektör çerçevesinin GT'deki karşılığının kutusu (x, y, w, h).
+
+    Dedektörün dört köşesi H^-1 ile GT'ye taşınır; GT çerçevesiyle
+    kesiştirilen bölgenin kutusu döner. GT'nin bu kutunun dışında kalan
+    kısmı hiçbir dedektör pikseline karşılık gelmez.
+    """
+    if H is None or not np.all(np.isfinite(H)):
+        return None
+    try:
+        Hinv = np.linalg.inv(np.asarray(H, dtype=np.float64))
+    except np.linalg.LinAlgError:
+        return None
+    dh, dw = float(det_shape[0]), float(det_shape[1])
+    corners = np.array([[[0.0, 0.0]], [[dw, 0.0]], [[dw, dh]], [[0.0, dh]]],
+                       dtype=np.float64)
+    try:
+        back = cv2.perspectiveTransform(corners, Hinv).reshape(-1, 2)
+    except cv2.error:                                       # noqa: BLE001
+        return None
+    if not np.all(np.isfinite(back)):
+        return None
+    gh, gw = gt_shape[0], gt_shape[1]
+    x0 = max(0, int(np.floor(back[:, 0].min())) - pad)
+    y0 = max(0, int(np.floor(back[:, 1].min())) - pad)
+    x1 = min(gw, int(np.ceil(back[:, 0].max())) + pad)
+    y1 = min(gh, int(np.ceil(back[:, 1].max())) + pad)
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def measurable_region(gt: np.ndarray, det_shape: tuple, H: np.ndarray,
+                      min_gain: float = 0.05) -> tuple | None:
+    """
+    Hizalamanın gerçekten yapılması gereken GT bölgesi:
+    (dedektöre düşen kutu) ∩ (desen içeren kutu).
+
+    `min_gain`: kırpma GT alanının bu kadarını atmıyorsa None döner —
+    ikinci bir ECC koşusu bedava değil, kazanç yoksa koşulmaz.
+    """
+    gh, gw = gt.shape[:2]
+    boxes = [b for b in (visible_bbox(gt.shape, det_shape, H),
+                         content_bbox(gt)) if b is not None]
+    if not boxes:
+        return None
+    x0 = max(b[0] for b in boxes)
+    y0 = max(b[1] for b in boxes)
+    x1 = min(b[0] + b[2] for b in boxes)
+    y1 = min(b[1] + b[3] for b in boxes)
+    if x1 - x0 < 16 or y1 - y0 < 16:
+        return None
+    if (x1 - x0) * (y1 - y0) > (1.0 - min_gain) * gw * gh:
+        return None
+    return (x0, y0, x1 - x0, y1 - y0)
+
+
+def _score_on_region(gt: np.ndarray, det: np.ndarray, H: np.ndarray,
+                     box: tuple) -> float:
+    """
+    İki homografiyi KARŞILAŞTIRILABİLİR biçimde puanlar.
+
+    ECC korelasyonu bunun için kullanılamaz: kırpılmış şablonun korelasyonu
+    kırpılmamışınkiyle aynı şeyi ölçmez (payda değişir), kırpılmış olan
+    neredeyse her zaman yüksek çıkar. Bu yüzden her iki aday da SABİT bir
+    bölgede — ölçüme giren kutuda — aynı NCC ile puanlanır.
+    """
+    if H is None or not np.all(np.isfinite(H)):
+        return -1.0
+    x, y, w, h = box
+    sub = gt[y:y + h, x:x + w]
+    T = np.array([[1.0, 0.0, x], [0.0, 1.0, y], [0.0, 0.0, 1.0]])
+    return _score_alignment(sub, det, np.asarray(H, dtype=np.float64) @ T)
+
+
+def refine_on_region(gt: np.ndarray, det: np.ndarray, H: np.ndarray,
+                     box: tuple, **kw) -> RefineResult:
+    """
+    ECC'yi yalnızca `box` bölgesiyle tekrar koşar; sonucu TAM GT
+    koordinatlarına geri çevirir.
+
+    Kırpma koordinat sistemini kaydırdığı için homografi öteleme matrisiyle
+    sarılır:  H_tam = H_kırpık · T^-1,  T = kırpık -> tam ötelemesi.
+    Bu sarma unutulursa homografi kutunun köşesi kadar kayar ve decenter
+    tamamen yanlış çıkar.
+    """
+    x, y, w, h = box
+    sub = gt[y:y + h, x:x + w]
+    T = np.array([[1.0, 0.0, x], [0.0, 1.0, y], [0.0, 0.0, 1.0]])
+    res = refine_ecc(sub, det, init=np.asarray(H, dtype=np.float64) @ T, **kw)
+    if res.homography is not None:
+        res.homography = res.homography @ np.linalg.inv(T)
+    return res
+
+
+# --------------------------------------------------------------------------
 # Tam zincir — tek çağrı
 # --------------------------------------------------------------------------
 
@@ -868,6 +1066,18 @@ class DenseResult:
     # bunu bilmeli. Dar kırpılmış görüntülerde tipiktir.
     mirror_ambiguous: bool = False
     mirror_margin: float = 0.0     # en iyi iki varyantın ECC farkı
+    # Desenin kendi dönme simetrisi (4 = 90°'de kendini tekrar ediyor).
+    # Böyle bir desende roll ancak `rotation_modulus_deg` modülünde
+    # bilinebilir — bu bir ölçüm eksikliği değil, desenin sınırıdır.
+    symmetry_order: int = 1
+    # Ölçüme giren bölge (bkz. 2B kademesi): hizalamanın gerçekten
+    # yapıldığı GT kutusu (x, y, w, h) ve ikinci geçişin benimsenip
+    # benimsenmediği. `region_used` False ise homografi GT'nin tamamıyla
+    # çözülmüş demektir.
+    region_box: tuple = ()
+    region_used: bool = False
+    region_score_before: float = float("nan")
+    region_score_after: float = float("nan")
     messages: list[str] = field(default_factory=list)
 
     @property
@@ -882,6 +1092,11 @@ class DenseResult:
     @property
     def tilt_deg(self) -> float:
         return self.tilt.total_tilt_deg if self.tilt else float("nan")
+
+    @property
+    def rotation_modulus_deg(self) -> float:
+        """Roll'ün belirlenebildiği modül (simetri yoksa 360°)."""
+        return 360.0 / self.symmetry_order if self.symmetry_order > 1 else 360.0
 
     @property
     def mirrored(self) -> bool:
@@ -906,8 +1121,37 @@ def analyze_dense(gt: np.ndarray, det: np.ndarray,
 
     Girdi olarak dosya yolu değil GRİ DİZİ alır — çağıran taraf görüntüyü
     zaten yüklemiş olur ve geçici dosya yazmak gerekmez.
+
+    HİZALAMA GT'NİN TAMAMIYLA YAPILMAZ. İki kısıt uygulanır (bkz. 2B):
+    desen içermeyen kenar en baştan atılır, dedektöre düşmeyen kısım ise
+    homografi bir kez çözüldükten sonra atılıp hizalama tekrarlanır.
     """
     res = DenseResult()
+
+    # --- 0. Şablonu desenin kapladığı kutuya indir ---
+    #
+    # Bu kırpma homografi GEREKTİRMEZ — yalnızca GT'nin kendi içeriğine
+    # bakar — o yüzden kaba kademeden ÖNCE yapılabilir. Kazancı da orada:
+    # kaba kademe genlik spektrumu üzerinden çalışır ve boş bir çerçeve
+    # kenarı spektrumu domine eder. Ölçülen çiftte GT'nin %61'i sabit
+    # siyahtı; o kısım ne ölçeğe ne dönmeye bilgi taşır.
+    #
+    # Homografi kırpılmış şablon için çözülür ve EN SONDA tam GT
+    # koordinatlarına geri çevrilir (H_tam = H_kırpık · T0^-1).
+    gt_full = gt
+    T0 = np.eye(3, dtype=np.float64)
+    box0 = content_bbox(gt)
+    if box0 is not None and box0[2] * box0[3] < 0.95 * gt.shape[0] * gt.shape[1]:
+        _x, _y, _w, _h = box0
+        gt = gt[_y:_y + _h, _x:_x + _w]
+        T0 = np.array([[1.0, 0.0, _x], [0.0, 1.0, _y], [0.0, 0.0, 1.0]])
+        res.messages.append(
+            f"Bilgi: ground truth deseninin kapladığı kutuya kırpıldı "
+            f"({_w}×{_h} px, çerçevenin "
+            f"%{100.0 * _w * _h / (gt_full.shape[0] * gt_full.shape[1]):.0f}'i) "
+            f"— boş kenar hizalamaya girmiyor.")
+    else:
+        box0 = None
 
     # Ayna varyantı seçimi ECC'YE bırakılır, kaba kademeye değil.
     #
@@ -942,7 +1186,7 @@ def analyze_dense(gt: np.ndarray, det: np.ndarray,
                 r = rr
         if r is None:
             continue
-        all_scores.append(r.correlation)
+        all_scores.append((r.correlation, vname))
         if best is None or r.correlation > best[0]:
             best = (r.correlation, c, r, dv)
 
@@ -954,15 +1198,91 @@ def analyze_dense(gt: np.ndarray, det: np.ndarray,
     res.messages.extend(res.coarse.messages)
     res.messages.extend(res.refine.messages)
 
-    # Ayna seçimi ne kadar kesin? En iyi iki skorun farkı ihmal edilebilirse
-    # seçim keyfîdir ve bu DÜRÜSTÇE raporlanmalıdır.
+    # --- 2B. ÖLÇÜME GİREN BÖLGEDE YENİDEN ÇÖZ ---
+    #
+    # Birinci geçiş GT'nin tamamıyla yapıldı — mecburen, çünkü hangi GT
+    # bölgesinin dedektöre düştüğü ancak homografi bilinince belli olur.
+    # Artık belli: bölge hesaplanır ve hizalama ORADA tekrar çözülür.
+    #
+    # Benimseme ölçütü ECC korelasyonu DEĞİLDİR — kırpılmış şablonun
+    # korelasyonu kırpılmamışınkiyle karşılaştırılamaz (bkz.
+    # `_score_on_region`). İki aday da sabit bölgede aynı NCC ile
+    # puanlanır ve ikinci geçiş yalnızca KESİN olarak iyileştiriyorsa
+    # benimsenir; aksi hâlde birinci geçişin sonucu korunur.
+    box = measurable_region(gt, det_v.shape, res.refine.homography)
+    if box is not None:
+        res.region_box = tuple(int(v) for v in box)
+        before = _score_on_region(gt, det_v, res.refine.homography, box)
+        r2 = refine_on_region(gt, det_v, res.refine.homography, box)
+        after = _score_on_region(gt, det_v, r2.homography, box)
+        res.region_score_before, res.region_score_after = (
+            float(before), float(after))
+        gw_, gh_ = gt.shape[1], gt.shape[0]
+        oran = 100.0 * box[2] * box[3] / float(gw_ * gh_)
+        if r2.homography is not None and after > before + 1e-6:
+            r2.variant = res.refine.variant
+            res.refine = r2
+            res.region_used = True
+            res.messages.append(
+                f"Bilgi: hizalama ground truth'un ölçüme giren kısmıyla "
+                f"({box[2]}×{box[3]} px, çerçevenin %{oran:.0f}'i) yeniden "
+                f"çözüldü — örtüşme skoru {before:.4f} → {after:.4f}.")
+        else:
+            res.messages.append(
+                f"Bilgi: ölçüme giren bölgeyle ({box[2]}×{box[3]} px) ikinci "
+                f"geçiş denendi ama iyileştirmedi ({before:.4f} → "
+                f"{after:.4f}); tam kareyle çözülen homografi korundu.")
+
+    # --- 2C. Homografiyi TAM GT koordinatlarına geri çevir ---
+    #
+    # Buradan sonrası (tilt ayrıştırması, kalıntı, çağıranın `pointing`
+    # çağrısı) tam GT'yi varsayar. Dönüşüm burada yapılır, tilt
+    # ayrıştırmasından ÖNCE: homografinin perspektif satırı öteleme ile
+    # sarıldığında değişir, dolayısıyla ayrıştırma hangi koordinatta
+    # yapıldığına duyarlıdır.
+    if box0 is not None:
+        _T0inv = np.linalg.inv(T0)
+        if res.refine.homography is not None:
+            res.refine.homography = res.refine.homography @ _T0inv
+        if res.region_box:
+            _rx, _ry, _rw, _rh = res.region_box
+            res.region_box = (_rx + box0[0], _ry + box0[1], _rw, _rh)
+
+    # Desenin kendi dönme simetrisi — belirsizliği DOĞRU teşhis etmek için
+    # gerekli (aşağıya bakınız).
+    res.symmetry_order = rotational_symmetry_order(gt)
+
+    # Ayna seçimi ne kadar kesin?
+    #
+    # DİKKAT — eskiden "en iyi iki skor eşitse ayna belirsiz" deniyordu ve bu
+    # YANLIŞ TEŞHİSTİ. Dört varyantın ikisi aynanın aynı tarafındadır:
+    #     flip_both = raw    + 180°        (ayna değil, DÖNME)
+    #     flip_v    = flip_h + 180°
+    # Ölçülen gerçek çiftte skorlar raw 0.8347 / flip_both 0.8347 (eşit) ve
+    # flip_h 0.7871 / flip_v 0.7872 idi: yani ayna NET biçimde çözülmüştü,
+    # eşit çıkan iki aday birbirinin 180° dönmüş hâliydi. Panel buna
+    # "ayna ekseni belirsiz" diyordu.
+    #
+    # Doğrusu: ayna belirsizliği İKİ GRUP arasındaki fark küçükse vardır.
+    # Grup içindeki eşitlik dönme belirsizliğidir ve desenin simetrisiyle
+    # açıklanır (bkz. `symmetry_order`) — uyarı değil, desenin sınırıdır.
     if len(all_scores) >= 2:
-        top2 = sorted(all_scores, reverse=True)[:2]
-        res.mirror_margin = float(top2[0] - top2[1])
-        res.mirror_ambiguous = bool(res.mirror_margin < MIRROR_MARGIN_MIN)
+        groups = {"a": ("raw", "flip_both"), "b": ("flip_h", "flip_v")}
+        gbest = {}
+        for key, names in groups.items():
+            vals = [sc for sc, vn in all_scores if vn in names]
+            if vals:
+                gbest[key] = max(vals)
+        if len(gbest) == 2:
+            res.mirror_margin = float(abs(gbest["a"] - gbest["b"]))
+            res.mirror_ambiguous = bool(res.mirror_margin < MIRROR_MARGIN_MIN)
+        else:
+            top2 = sorted((sc for sc, _ in all_scores), reverse=True)[:2]
+            res.mirror_margin = float(top2[0] - top2[1])
+            res.mirror_ambiguous = bool(res.mirror_margin < MIRROR_MARGIN_MIN)
         if res.mirror_ambiguous:
             res.messages.append(
-                f"Ayna ekseni belirsiz (en iyi iki varyant farkı "
+                f"Ayna ekseni belirsiz (aynalı/aynasız varyantların farkı "
                 f"{res.mirror_margin:.4f}) — dönme bu belirsizlikten "
                 f"etkilenebilir; decenter ve kapsama etkilenmez.")
 
@@ -990,7 +1310,7 @@ def analyze_dense(gt: np.ndarray, det: np.ndarray,
     if with_residual:
         # `det_v` varyantı ZATEN uygulanmış görüntüdür; burada variant="raw"
         # verilmezse ayna ikinci kez uygulanır ve kalıntı tamamen bozulur.
-        res.residual = residual_flow(gt, det_v, res.refine.homography,
+        res.residual = residual_flow(gt_full, det_v, res.refine.homography,
                                      variant="raw", center=center)
         res.messages.extend(res.residual.messages)
 
